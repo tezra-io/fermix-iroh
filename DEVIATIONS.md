@@ -10,6 +10,9 @@ crates in Cargo's registry (`iroh-1.3.0`, `iroh-dns-1.3.0`, `noq-1.3.0`,
 
 ## A. Where iroh 1.3.0 needs more than the contract says
 
+The daemon's contract adopted A1 to A4 on 2026-10-14 (re-vendored in
+`protocol/PROTOCOL.md`); they stay here as the evidence for that wording.
+
 ### A1. Proxy variables: not calling `proxy_from_env` is not enough
 
 - **Contract:** "It never calls iroh's `proxy_from_env`, so proxy variables in

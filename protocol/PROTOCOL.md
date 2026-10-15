@@ -6,8 +6,8 @@ the daemon from any network (M62). The helper accepts iroh connections and
 bridges each accepted stream to a Unix socket the daemon listens on; it holds no
 trust of its own and decides nothing.
 
-**Source of truth:** the daemon's codec, `FermixChannels.Mobile.IrohHelper`, and
-its bridge listener, `FermixChannels.Mobile.Bridge`. This file and `fixtures/*`
+**Source of truth:** the daemon's codec, `FermixChannels.Mobile.Iroh.HelperProtocol`,
+and its bridge listener, `FermixChannels.Mobile.Iroh.Bridge`. This file and `fixtures/*`
 are the machine-readable export of those modules, and the daemon's contract test
 asserts they never drift from it. The `tezra-io/fermix-iroh` repository **vendors
 this file and the fixtures** and tests its own codec against them. Fermix defines
@@ -23,8 +23,12 @@ the protocol; the helper implements it.
   stream to one connection on the bridge socket. It binds UDP sockets for QUIC,
   asks the local router for a port mapping, and probes only the relays the
   daemon named; it opens no listener and contacts no other host. It reads no
-  file but the key and uses no address lookup service. It never calls iroh's
-  `proxy_from_env`, so proxy variables in its environment have no effect.
+  file but the key and the system's resolver configuration (to resolve the
+  relays' names), resolves through the system's nameservers only, never a
+  public resolver, and uses no address lookup service. Proxy variables in its
+  environment have no effect: it never calls iroh's `proxy_from_env`, and it
+  removes them from its own environment before anything reads them, since
+  iroh's relay probes would otherwise honour them.
 
 ## Process
 
@@ -109,7 +113,7 @@ helper                                   daemon
 |---|---|---|
 | `start` | `secret_key_path`, `bridge_socket`, `alpn`, `relays`, `limits` | Exactly once, after `hello`. The helper reads the key, binds the endpoint and answers `ready`, or `error`. |
 | `set_relays` | `relays` | Replaces the endpoint's relay map at run time: relays not named are removed, new ones added. Valid only after `ready`. |
-| `shutdown` | — | Stop accepting; close every connection with application code `0`, reason `shutdown` (iroh's `Endpoint::close` alone sends an empty reason); close every bridge connection; wait for iroh's drain, bounded by its own timeout; exit `0` within **5 s**. The daemon kills the process group after that. This is also how the daemon turns remote reach off: after the exit nothing contacts a relay. |
+| `shutdown` | — | Stop accepting; close every connection with application code `0`, reason `shutdown` (iroh's `Endpoint::close` alone sends an empty reason; a connection still in its handshake cannot carry a reason and is closed without one); close every bridge connection; wait for iroh's drain, bounded by its own timeout; exit `0` within **5 s**. The daemon kills the process group after that. This is also how the daemon turns remote reach off: after the exit nothing contacts a relay. |
 
 - **`secret_key_path`:** an absolute path to a file of exactly 32 bytes, the raw
   Ed25519 secret key, mode `0600`. The daemon writes it atomically before the
