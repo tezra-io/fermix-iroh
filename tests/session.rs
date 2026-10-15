@@ -304,6 +304,40 @@ async fn a_foreign_alpn_is_refused_in_the_handshake_and_reported() {
     .await;
 }
 
+// iroh's keep-alive would hold a connection that opens no stream, and its
+// slot, for as long as the peer answers: the helper closes it, `idle`, once it
+// has had no stream for `streamless_idle`, and the slot is free again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_connection_with_no_stream_is_closed_idle_and_frees_its_slot() {
+    bounded(async {
+        let relay = TestRelay::start().await;
+        let mut net = support::test_network();
+        net.timings.streamless_idle = Duration::from_secs(2);
+        let mut helper = Helper::spawn_on(net).await;
+        let _bridge = helper.listen_bridge();
+        helper.start(&[&relay], 1, &relay).await;
+
+        let first = phone(&relay).await;
+        let idle = dial(&first, helper.endpoint_id(), &relay, ALPN)
+            .await
+            .unwrap();
+        let reason = within("the idle close", idle.closed()).await;
+        match reason {
+            ConnectionError::ApplicationClosed(close) => {
+                assert_eq!(close.error_code, VarInt::from_u32(0));
+                assert_eq!(&close.reason[..], b"idle");
+            }
+            other => panic!("expected an application close, got {other:?}"),
+        }
+
+        let second = phone(&relay).await;
+        dial(&second, helper.endpoint_id(), &relay, ALPN)
+            .await
+            .expect("the slot the idle connection held is free");
+    })
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_connection_over_the_limit_is_refused_before_its_handshake() {
     bounded(async {

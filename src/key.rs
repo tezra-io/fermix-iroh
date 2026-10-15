@@ -42,8 +42,14 @@ impl KeyError {
     }
 }
 
-/// Load the secret key at `path`.
+/// Load the secret key at `path`. A symlink is refused, never followed: the
+/// key is a regular file in the daemon's private directory.
 pub fn load(path: &Path) -> Result<SecretKey, KeyError> {
+    let link = std::fs::symlink_metadata(path)
+        .map_err(|e| KeyError::Unreadable(format!("key file cannot be inspected: {e}")))?;
+    if link.file_type().is_symlink() {
+        return Err(KeyError::Invalid("key file is not a regular file".into()));
+    }
     let mut file = File::open(path)
         .map_err(|e| KeyError::Unreadable(format!("key file cannot be opened: {e}")))?;
     let meta = file
@@ -113,6 +119,19 @@ mod tests {
             key.public().to_string(),
             "79b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664"
         );
+    }
+
+    // The daemon refuses a key that is not a regular file; a symlink to one
+    // is refused here too, not followed.
+    #[test]
+    fn a_symlink_to_a_valid_key_is_invalid() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = write_key(dir.path(), &fixture_bytes(), 0o600);
+        let link = dir.path().join("linked_key");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let err = load(&link).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::KeyInvalid);
+        assert_eq!(err.to_string(), "key file is not a regular file");
     }
 
     #[test]

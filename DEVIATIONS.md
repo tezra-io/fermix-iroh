@@ -185,6 +185,16 @@ A connection holds a slot from the moment it is accepted for its handshake
 until its task ends, so `max_connections` bounds handshakes in flight as well as
 established connections. Refused attempts hold no slot.
 
+A slot is never held for nothing (adopted in the contract, 2026-10-14, after a
+review): a handshake not finished within 10 s is dropped; a connection that has
+had no stream for 30 s is closed with code 0, reason `idle` (iroh's 5 s
+keep-alive would otherwise keep it for as long as the peer answers); and once
+half the slots are taken, a peer whose address QUIC has not validated gets a
+Retry first, so forged Initials never take one. Before a slot is taken, the
+memory a flood of Initials can cost is noq's own bound (65,536 pending
+incomings, 100 MiB of buffered data), not anything in `start.limits`. The
+timings live in `endpoint::Timings`; the hermetic suite shortens the idle one.
+
 ### B10. `closed`
 
 Sent once per connection that had a `path`, after its last `path`, when the

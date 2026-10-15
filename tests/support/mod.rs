@@ -14,7 +14,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use fermix_iroh::endpoint::{BindScope, Network};
+use fermix_iroh::endpoint::{BindScope, Network, Timings};
 use fermix_iroh::protocol::Event;
 use fermix_iroh::session::{self, Exit};
 use iroh::endpoint::{Connection, PortmapperConfig, presets};
@@ -57,6 +57,7 @@ pub fn test_network() -> Network {
         ca_tls: CaTlsConfig::insecure_skip_verify(),
         scope: BindScope::Loopback,
         portmapper: PortmapperConfig::Disabled,
+        timings: Timings::production(),
     }
 }
 
@@ -105,6 +106,11 @@ pub struct Helper {
 impl Helper {
     /// Spawn a session and read its `hello`.
     pub async fn spawn() -> Self {
+        Self::spawn_on(test_network()).await
+    }
+
+    /// Spawn a session on `net` and read its `hello`.
+    pub async fn spawn_on(net: Network) -> Self {
         let dir = tempfile::tempdir().expect("a temp dir");
         let key = SecretKey::from_bytes(&rand_bytes());
         let key_path = dir.path().join("iroh_key");
@@ -118,7 +124,7 @@ impl Helper {
         );
         let (stdin_tx, stdin_rx) = tokio::io::duplex(128 * 1024);
         let (stdout_tx, stdout_rx) = tokio::io::duplex(128 * 1024);
-        let session = tokio::spawn(session::run(stdin_rx, stdout_tx, test_network()));
+        let session = tokio::spawn(session::run(stdin_rx, stdout_tx, net));
         let mut helper = Helper {
             dir,
             key,

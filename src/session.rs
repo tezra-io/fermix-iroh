@@ -196,6 +196,7 @@ impl Session {
         let acceptor = Arc::new(Acceptor::new(
             endpoint.clone(),
             cfg,
+            self.net.timings,
             self.sink.clone(),
             stop.clone(),
             tasks.clone(),

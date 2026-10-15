@@ -136,11 +136,25 @@ package supports; building them locally needs `musl-tools` (`musl-gcc`) and
    `MACOS_*`/`APPLE_*` secrets are mandatory; the run fails without them),
    writes a `.sha256` beside every artifact, signs every artifact with cosign
    (keyless), and waits in the `release` environment for the owner's approval
-   before it publishes anything.
+   before it publishes anything. The macOS legs first wait in the
+   `release-signing` environment for the owner's approval, because the signing
+   secrets are reachable only there.
 3. Pin the tag, the per-target sha256 values from `SHA256SUMS` and the signing
    identity in the engine by a normal PR. Never hand-write a checksum.
 4. **Never re-run a published tag's release.** A rebuilt binary does not hash
    the same, so every engine pinning that tag would refuse it. Cut a new version.
+
+### Repository setup the release needs
+
+- **`release-signing` environment**: a required reviewer (the owner), deployments
+  limited to tags matching `v*`, and the seven `MACOS_*`/`APPLE_*` secrets as
+  *environment* secrets. Never set them as repository or organization secrets:
+  every job could read those, including one a tag's edited workflow adds.
+- **`release` environment**: a required reviewer, limited to `v*` tags; it gates
+  publication.
+- **A tag ruleset** restricting creation, update and deletion of `v*` tags to the
+  owner, as the engine's release tags are.
+- `main` protected and changed only by pull request.
 
 ## Architecture
 

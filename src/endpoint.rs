@@ -12,6 +12,7 @@ use std::net::Ipv4Addr;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use iroh::dns::{DnsResolver, FallbackMode};
@@ -69,6 +70,32 @@ pub struct Network {
     pub scope: BindScope,
     /// Whether to ask the local router for a port mapping.
     pub portmapper: PortmapperConfig,
+    /// How long a connection may hold a slot without finishing its handshake
+    /// or without a stream.
+    pub timings: Timings,
+}
+
+/// The bounds on how long a connection holds one of `max_connections`.
+#[derive(Debug, Clone, Copy)]
+pub struct Timings {
+    /// A handshake not finished by then is dropped, freeing its slot, so a
+    /// peer that only starts handshakes cannot hold the connection bound.
+    pub handshake_deadline: Duration,
+    /// A connection with no stream open for this long is closed with code 0,
+    /// reason `idle`: iroh's keep-alive would otherwise keep it, and its slot,
+    /// for as long as the peer answers. A phone renewing a session opens its
+    /// next stream at once.
+    pub streamless_idle: Duration,
+}
+
+impl Timings {
+    /// The released helper's bounds.
+    pub fn production() -> Self {
+        Timings {
+            handshake_deadline: Duration::from_secs(10),
+            streamless_idle: Duration::from_secs(30),
+        }
+    }
 }
 
 impl Network {
@@ -79,6 +106,7 @@ impl Network {
             ca_tls: CaTlsConfig::embedded(),
             scope: BindScope::AllInterfaces,
             portmapper: PortmapperConfig::default(),
+            timings: Timings::production(),
         }
     }
 }
@@ -203,12 +231,34 @@ impl Slots {
             });
         taken.ok().map(|_| Slot(self.clone()))
     }
+
+    /// Half the slots or more are taken: new peers must prove their address.
+    fn under_pressure(&self) -> bool {
+        self.active.load(Ordering::SeqCst) * 2 >= self.max
+    }
+}
+
+/// One open stream of a connection; dropping it counts the stream closed.
+struct OpenStream(Arc<AtomicUsize>);
+
+impl OpenStream {
+    fn new(streams: &Arc<AtomicUsize>) -> Self {
+        streams.fetch_add(1, Ordering::SeqCst);
+        OpenStream(streams.clone())
+    }
+}
+
+impl Drop for OpenStream {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Everything the accept loop and its connection tasks share.
 pub struct Acceptor {
     endpoint: Endpoint,
     slots: Arc<Slots>,
+    timings: Timings,
     socket: Arc<Path>,
     sink: EventSink,
     stop: CancellationToken,
@@ -230,6 +280,7 @@ impl Acceptor {
     pub fn new(
         endpoint: Endpoint,
         cfg: &StartConfig,
+        timings: Timings,
         sink: EventSink,
         stop: CancellationToken,
         tasks: TaskTracker,
@@ -240,6 +291,7 @@ impl Acceptor {
                 active: AtomicUsize::new(0),
                 max: cfg.limits.max_connections,
             }),
+            timings,
             socket: Arc::from(cfg.bridge_socket.as_path()),
             sink,
             stop,
@@ -256,6 +308,17 @@ impl Acceptor {
             };
             let Some(incoming) = incoming else {
                 return AcceptEnd::EndpointClosed;
+            };
+            // Under load a source must prove its address first (a Retry costs
+            // it one round trip), so forged Initials never take a slot.
+            let incoming = if self.slots.under_pressure() && !incoming.remote_addr_validated() {
+                match incoming.retry() {
+                    Ok(()) => continue,
+                    // Refused only for an address already validated.
+                    Err(err) => err.into_incoming(),
+                }
+            } else {
+                incoming
             };
             match self.slots.try_take() {
                 Some(slot) => {
@@ -311,12 +374,13 @@ impl Acceptor {
             Ok(accepting) => accepting,
             Err(e) => return self.handshake_failed(&e).await,
         };
-        match accepting.await {
-            Ok(conn) => Some(conn),
-            Err(ConnectingError::ConnectionError { source, .. }) => {
+        match tokio::time::timeout(self.timings.handshake_deadline, accepting).await {
+            Ok(Ok(conn)) => Some(conn),
+            Ok(Err(ConnectingError::ConnectionError { source, .. })) => {
                 self.handshake_failed(&source).await
             }
-            Err(_) => None,
+            // Dropping the unfinished handshake ends it and frees the slot.
+            Ok(Err(_)) | Err(_) => None,
         }
     }
 
@@ -338,11 +402,15 @@ impl Acceptor {
     }
 
     /// The connection's life: bridge each accepted stream, report each path
-    /// change, and on shutdown close it with code 0, reason `shutdown`.
+    /// change, close it with code 0, reason `idle` once it has had no stream
+    /// for `streamless_idle`, and on shutdown with code 0, reason `shutdown`.
     async fn stream_loop(&self, conn: &Connection, kind: u8, tracker: &mut PathTracker) {
         let peer = conn.remote_id();
         let mut paths = conn.paths_stream();
         let mut paths_open = true;
+        let streams = Arc::new(AtomicUsize::new(0));
+        let mut idle_since = Some(Instant::now());
+        let mut check = tokio::time::interval(self.timings.streamless_idle / 6);
         loop {
             tokio::select! {
                 _ = self.stop.cancelled() => {
@@ -350,9 +418,22 @@ impl Acceptor {
                     return;
                 }
                 accepted = conn.accept_bi() => match accepted {
-                    Ok((send, recv)) => self.spawn_bridge(send, recv, peer, kind),
+                    Ok((send, recv)) => {
+                        idle_since = None;
+                        self.spawn_bridge(send, recv, peer, kind, OpenStream::new(&streams));
+                    }
                     Err(_) => return,
                 },
+                _ = check.tick() => {
+                    if streams.load(Ordering::SeqCst) > 0 {
+                        idle_since = None;
+                    } else if idle_since.get_or_insert_with(Instant::now).elapsed()
+                        >= self.timings.streamless_idle
+                    {
+                        conn.close(VarInt::from_u32(0), b"idle");
+                        return;
+                    }
+                }
                 snapshot = paths.next(), if paths_open => match snapshot {
                     Some(list) => {
                         if let Some(event) = tracker.observe(&list) {
@@ -365,7 +446,14 @@ impl Acceptor {
         }
     }
 
-    fn spawn_bridge(&self, send: SendStream, recv: RecvStream, peer: EndpointId, kind: u8) {
+    fn spawn_bridge(
+        &self,
+        send: SendStream,
+        recv: RecvStream,
+        peer: EndpointId,
+        kind: u8,
+        open: OpenStream,
+    ) {
         let ctx = StreamContext {
             peer,
             kind,
@@ -373,7 +461,10 @@ impl Acceptor {
             sink: self.sink.clone(),
             stop: self.stop.child_token(),
         };
-        self.tasks.spawn(bridge::run(send, recv, ctx));
+        self.tasks.spawn(async move {
+            bridge::run(send, recv, ctx).await;
+            drop(open);
+        });
     }
 }
 
@@ -404,5 +495,29 @@ mod tests {
         assert!(slots.try_take().is_none());
         drop((b, c));
         assert_eq!(slots.active.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn addresses_are_validated_once_half_the_slots_are_taken() {
+        let slots = Arc::new(Slots {
+            active: AtomicUsize::new(0),
+            max: 4,
+        });
+        let a = slots.try_take().unwrap();
+        assert!(!slots.under_pressure());
+        let b = slots.try_take().unwrap();
+        assert!(slots.under_pressure());
+        drop((a, b));
+        assert!(!slots.under_pressure());
+    }
+
+    #[test]
+    fn an_open_stream_is_counted_until_dropped() {
+        let streams = Arc::new(AtomicUsize::new(0));
+        let one = OpenStream::new(&streams);
+        let two = OpenStream::new(&streams);
+        assert_eq!(streams.load(Ordering::SeqCst), 2);
+        drop((one, two));
+        assert_eq!(streams.load(Ordering::SeqCst), 0);
     }
 }
