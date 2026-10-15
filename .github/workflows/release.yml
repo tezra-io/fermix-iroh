@@ -1,0 +1,337 @@
+name: release
+# Tag `vX.Y.Z` on main and push it. This builds `fermix-iroh` for four targets,
+# Developer-ID-signs and notarizes both macOS binaries, writes a `.sha256`
+# beside every artifact, cosign-signs every artifact (keyless, Sigstore OIDC),
+# and publishes the GitHub release only after the owner approves the `release`
+# environment.
+#
+# Artifacts per target: the bare binary `fermix-iroh-<asset>` (what the engine's
+# release build pins and bundles) and `fermix-iroh-<version>-<asset>.tar.gz`
+# (binary, LICENSE, README), each with `.sha256`, `.sig` and `.pem`, plus one
+# `SHA256SUMS`.
+#
+# macOS signing is mandatory: the build fails if any of these repository (or
+# organization) secrets is missing, never publishing an unsigned binary:
+#   MACOS_CERT_P12_BASE64 MACOS_CERT_PASSWORD MACOS_KEYCHAIN_PASSWORD
+#   MACOS_DEVELOPER_ID APPLE_ID APPLE_TEAM_ID APPLE_APP_PASSWORD
+#
+# Never re-run a published tag's release: a rebuilt binary does not hash the
+# same, so every engine that pins the tag would refuse it. Cut a new version.
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to build and sign (dry run; nothing is published)
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: "1.97.1"
+
+jobs:
+  preflight:
+    name: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: The tag names the crate's version and the changelog has it
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
+          [ "$TAG" = "v${version}" ] || {
+            echo "::error::Tag $TAG does not match Cargo.toml version $version"
+            exit 1
+          }
+          grep -q "^## \[${version}\] - [0-9]" CHANGELOG.md || {
+            echo "::error::CHANGELOG.md has no dated entry for ${version}"
+            exit 1
+          }
+
+  build:
+    name: ${{ matrix.target }}
+    needs: preflight
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-14
+            asset: macos-aarch64
+          # Cross-compiled on the arm64 runner: GitHub's Intel macOS runners
+          # are being retired, and the helper needs no Intel host to build.
+          - target: x86_64-apple-darwin
+            runner: macos-14
+            asset: macos-x86_64
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+            asset: linux-aarch64
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+            asset: linux-x86_64
+    env:
+      TARGET: ${{ matrix.target }}
+      ASSET: ${{ matrix.asset }}
+      BIN: target/${{ matrix.target }}/release/fermix-iroh
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Install the toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target "$TARGET"
+          rustup default "$RUST_TOOLCHAIN"
+          rustc --version && cargo --version
+
+      - name: Install musl-gcc (Linux)
+        if: startsWith(matrix.runner, 'ubuntu')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
+        run: cargo build --release --locked --target "$TARGET"
+
+      - name: Verify the binary
+        run: |
+          set -euo pipefail
+          file "$BIN"
+          case "$TARGET" in
+            x86_64-apple-darwin)
+              # Built on arm64; check the slice rather than run it.
+              [ "$(lipo -archs "$BIN")" = "x86_64" ] ;;
+            *-linux-musl)
+              file "$BIN" | grep -q "statically linked"
+              "$BIN" --version ;;
+            *)
+              "$BIN" --version ;;
+          esac
+
+      - name: Validate signing secrets (macOS)
+        if: startsWith(matrix.runner, 'macos')
+        env:
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          MACOS_KEYCHAIN_PASSWORD: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
+          MACOS_DEVELOPER_ID: ${{ secrets.MACOS_DEVELOPER_ID }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          set -euo pipefail
+          missing=""
+          for v in MACOS_CERT_P12_BASE64 MACOS_CERT_PASSWORD MACOS_KEYCHAIN_PASSWORD \
+                   MACOS_DEVELOPER_ID APPLE_ID APPLE_TEAM_ID APPLE_APP_PASSWORD; do
+            [ -n "${!v}" ] || missing="$missing $v"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error title=Missing signing secrets::macOS signing is mandatory but these secrets are unset:$missing"
+            exit 1
+          fi
+
+      - name: Import the Developer ID certificate (macOS)
+        if: startsWith(matrix.runner, 'macos')
+        env:
+          CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
+          printf '%s' "$CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" -P "$CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$keychain" >/dev/null
+          security list-keychain -d user -s "$keychain" login.keychain-db
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+      - name: Sign and notarize (macOS)
+        if: startsWith(matrix.runner, 'macos')
+        env:
+          DEVELOPER_ID: ${{ secrets.MACOS_DEVELOPER_ID }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          set -euo pipefail
+          codesign --force --timestamp --options runtime --sign "$DEVELOPER_ID" "$BIN"
+          codesign --verify --strict --verbose=2 "$BIN"
+          ditto -c -k --keepParent "$BIN" "$RUNNER_TEMP/notarize.zip"
+          result="$(xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" \
+            --wait --timeout 30m --output-format json)"
+          rm -f "$RUNNER_TEMP/notarize.zip"
+          status="$(printf '%s' "$result" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("status",""))')"
+          id="$(printf '%s' "$result" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("id",""))')"
+          if [ "$status" != "Accepted" ]; then
+            echo "::error title=Notarization failed::status=$status (submission $id)"
+            xcrun notarytool log "$id" \
+              --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD"
+            exit 1
+          fi
+          # A bare executable cannot be stapled; Gatekeeper checks the notary
+          # service online, and the Mac app re-signs it inside its own bundle.
+
+      - name: Package
+        id: package
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
+          name="fermix-iroh-${version}-${ASSET}"
+          bare="fermix-iroh-${ASSET}"
+          mkdir -p "dist/${name}"
+          cp "$BIN" "dist/${name}/fermix-iroh"
+          cp LICENSE README.md "dist/${name}/"
+          tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+          rm -rf "dist/${name}"
+          cp "$BIN" "dist/${bare}"
+          if command -v sha256sum >/dev/null 2>&1; then
+            hash() { sha256sum "$1"; }
+          else
+            hash() { shasum -a 256 "$1"; }
+          fi
+          (cd dist && hash "${name}.tar.gz" > "${name}.tar.gz.sha256")
+          (cd dist && hash "${bare}" > "${bare}.sha256")
+          cat dist/*.sha256
+          echo "artifact=${ASSET}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: build-${{ steps.package.outputs.artifact }}
+          path: dist/*
+          if-no-files-found: error
+
+  # Sign every artifact with cosign and verify each signature against this
+  # workflow's identity. Runs for dry runs too, so signing is never first
+  # exercised on a real release.
+  stage:
+    name: sign
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: build-*
+          path: dist
+          merge-multiple: true
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3.9.1
+
+      - name: Sign, verify and sum
+        env:
+          CERTIFICATE_IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/release.yml@${{ github.ref }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          cd dist
+          artifacts=(fermix-iroh-macos-aarch64 fermix-iroh-macos-x86_64 \
+                     fermix-iroh-linux-aarch64 fermix-iroh-linux-x86_64 \
+                     fermix-iroh-*.tar.gz)
+          [ "${#artifacts[@]}" -eq 8 ] || {
+            echo "::error::Expected four binaries and four tarballs, found ${#artifacts[@]}"
+            exit 1
+          }
+          for artifact in "${artifacts[@]}"; do
+            [ -f "$artifact" ] || { echo "::error::Missing $artifact"; exit 1; }
+            sha256sum --check "${artifact}.sha256"
+            cosign sign-blob --yes \
+              --output-signature "${artifact}.sig" \
+              --output-certificate "${artifact}.pem" \
+              "$artifact"
+            cosign verify-blob \
+              --certificate "${artifact}.pem" \
+              --signature "${artifact}.sig" \
+              --certificate-identity "$CERTIFICATE_IDENTITY" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              "$artifact"
+          done
+          cat ./*.sha256 | sort -k2 > SHA256SUMS
+          echo "--- SHA256SUMS ---"
+          cat SHA256SUMS
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: signed-release
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: publish
+    needs: stage
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # The required reviewer of the `release` environment decides whether this
+    # signed build becomes a release; nothing is published before that.
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: signed-release
+          path: dist
+
+      - name: Compose the release notes
+        env:
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          {
+            echo "The Fermix daemon's iroh endpoint, built against iroh 1.3.0."
+            echo
+            echo "Wire \`protocol_version\` 1. See CHANGELOG.md for details."
+            echo
+            echo "## Pinning this release in the engine"
+            echo
+            echo "The engine's release build bundles the bare \`fermix-iroh-<target>\`"
+            echo "binaries. Pin this tag, each binary's sha256 from \`SHA256SUMS\` below"
+            echo "(not the tarball's), and the signing identity:"
+            echo
+            echo '```'
+            echo "https://github.com/${REPO}/.github/workflows/release.yml@refs/tags/${TAG}"
+            echo '```'
+            echo
+            echo "Land the pins in the fermix repository as a normal PR; never hand-write a checksum."
+            echo
+            echo '```'
+            cat dist/SHA256SUMS
+            echo '```'
+          } > notes.md
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # A published tag is never rebuilt: its pins live in released engines.
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            echo "::error::Release $TAG already exists; cut a new version instead of re-publishing."
+            exit 1
+          fi
+          gh release create "$TAG" --repo "$REPO" --title "$TAG" --notes-file notes.md dist/*

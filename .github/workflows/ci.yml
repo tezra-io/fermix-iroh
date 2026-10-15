@@ -1,0 +1,112 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  # One toolchain for CI and releases, so a lint never passes in one and fails
+  # in the other.
+  RUST_TOOLCHAIN: "1.97.1"
+
+jobs:
+  # The whole suite is hermetic: the integration tests run iroh's relay server
+  # in-process on 127.0.0.1 and bind every endpoint to loopback.
+  gates:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, ubuntu-24.04]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+
+      - name: Install the toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component rustfmt,clippy
+          rustup default "$RUST_TOOLCHAIN"
+          rustc --version && cargo --version
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Lint
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build --locked
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Refuse a hand-edited protocol export
+        # protocol/ is the daemon's export. A change here must come from
+        # re-vendoring it, in the same change as the daemon's.
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          git fetch --no-tags origin "$BASE_REF"
+          if git diff --name-only "origin/${BASE_REF}...HEAD" -- protocol/ | grep -q .; then
+            echo "::error::protocol/ is vendored from the fermix daemon and must not be edited here."
+            echo "Re-vendor the daemon's export instead, and say so in the PR body."
+            exit 1
+          fi
+
+  # The two release targets that are cross-built, compiled on every change so a
+  # release is never their first build.
+  cross:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            runner: macos-14
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install the toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target ${{ matrix.target }}
+          rustup default "$RUST_TOOLCHAIN"
+
+      - name: Install musl-gcc
+        if: endsWith(matrix.target, '-musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
+      - name: Check the binary's architecture
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/fermix-iroh"
+          file "$bin"
+          case "${{ matrix.target }}" in
+            x86_64-apple-darwin) [ "$(lipo -archs "$bin")" = "x86_64" ] ;;
+            x86_64-unknown-linux-musl)
+              file "$bin" | grep -q "statically linked"
+              "$bin" --version ;;
+          esac
