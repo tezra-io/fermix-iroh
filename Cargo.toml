@@ -1,0 +1,51 @@
+# Standalone package: declared explicitly so a parent directory can never
+# capture it into someone else's workspace.
+[workspace]
+
+[package]
+name = "fermix-iroh"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "MIT"
+description = "The Fermix daemon's iroh endpoint: NDJSON control over stdio, each accepted iroh stream bridged to the daemon's Unix socket"
+repository = "https://github.com/tezra-io/fermix-iroh"
+readme = "README.md"
+publish = false
+
+[[bin]]
+name = "fermix-iroh"
+path = "src/main.rs"
+
+[lib]
+name = "fermix_iroh"
+path = "src/lib.rs"
+
+[dependencies]
+# iroh and its relay crate are pinned exactly: the daemon compares `hello`'s
+# `iroh_version` with the version its relays run, and an upgrade is a reviewed,
+# paired change (M62 §7 "Dependencies"). Everything else is pinned by Cargo.lock
+# and built with `--locked`.
+iroh = { version = "=1.3.0" }
+iroh-relay = { version = "=1.3.0", default-features = false }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util", "net", "time", "sync"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+zeroize = "1"
+
+[dev-dependencies]
+# `test-utils` gives the integration tests an in-process relay server and lets
+# them trust its self-signed certificate. Dev-dependency features never reach
+# the released binary.
+iroh = { version = "=1.3.0", features = ["test-utils"] }
+proptest = { version = "=1.12.0", default-features = false, features = ["std"] }
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
