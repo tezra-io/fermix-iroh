@@ -99,7 +99,7 @@ helper                                   daemon
 | `closed` | `endpoint_id` | A connection that had a `path` ended, however it ended. Sent once per connection, after its last `path`; the daemon forgets that peer's path. |
 | `refused` | `reason`, `endpoint_id` (hex, or `null` where it is not known) | A connection or stream the helper refused: `busy` (over `limits.max_connections`, refused before its handshake, so `endpoint_id` is `null`), `alpn` (no matching application protocol), `bridge_unreachable` (the bridge socket could not be reached for a stream). The daemon counts these toward its admission bound and per-peer accounting; it never parses `log` text. |
 | `log` | `level` (`info` or `warn`), `message` | A diagnostic for the daemon's log, at most 512 bytes. The daemon logs it and never matches on it. Never key material, never stream contents. |
-| `error` | `code`, `message` | Fatal: the helper exits `1` after sending it. `code` is one of `bad_request` (a malformed or out-of-order `op`), `key_unreadable`, `key_invalid`, `bind_failed`, `internal`. `message` is at most 512 bytes. |
+| `error` | `code`, `message` | Fatal: the helper exits `1` after sending it. `code` is one of `bad_request` (a malformed or out-of-order `op`, one with an unknown or missing field, or a `start` whose values the helper refuses), `key_unreadable`, `key_invalid`, `bind_failed`, `internal`. `message` is at most 512 bytes. The daemon restarts a helper that failed, except after `bad_request` or `key_invalid`, which the same `start` would get again. |
 
 ## Ops the daemon sends
 

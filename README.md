@@ -74,6 +74,20 @@ stop before the endpoint binds.
 | `tests/process.rs` | the binary over real pipes: `hello` first, exit codes, every failure before bind |
 | `tests/session.rs` | end to end over a local relay: preamble, copying both ways, every *Ending* rule, renewal on a second stream, stream credit, ALPN and busy refusals, unreachable bridge, `set_relays`, `closed`, shutdown within 5 s, end of stdin |
 
+### The engine's end-to-end test
+
+`examples/test_peer.rs` is a stand-in phone for the engine's opt-in end-to-end
+test (`Mobile.Iroh.EndToEndTest`): it dials a running helper directly at one
+UDP address, with no relay, offering `fermix/mobile/1`, and pipes one stream to
+its stdin and stdout. An example, so the release never carries it:
+
+```sh
+cargo build --release --locked
+cargo build --release --locked --example test_peer
+# in the engine checkout:
+FERMIX_IROH_DIR=../fermix-iroh mix test --only iroh_end_to_end
+```
+
 ### Targets
 
 Releases are built for four targets, all from `release.yml`:
