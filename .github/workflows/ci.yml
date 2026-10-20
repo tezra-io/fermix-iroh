@@ -107,6 +107,6 @@ jobs:
           case "${{ matrix.target }}" in
             x86_64-apple-darwin) [ "$(lipo -archs "$bin")" = "x86_64" ] ;;
             x86_64-unknown-linux-musl)
-              file "$bin" | grep -q "statically linked"
+              file "$bin" | grep -qE "statically linked|static-pie linked"
               "$bin" --version ;;
           esac

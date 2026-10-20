@@ -126,7 +126,7 @@ jobs:
               # Built on arm64; check the slice rather than run it.
               [ "$(lipo -archs "$BIN")" = "x86_64" ] ;;
             *-linux-musl)
-              file "$BIN" | grep -q "statically linked"
+              file "$BIN" | grep -qE "statically linked|static-pie linked"
               "$BIN" --version ;;
             *)
               "$BIN" --version ;;
