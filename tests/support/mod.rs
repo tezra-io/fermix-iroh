@@ -5,15 +5,19 @@
 //! with no port mapping and no address lookup, and a fake bridge
 //! `UnixListener` in a temporary directory. The helper session is the same
 //! `session::run` the binary runs, given only a test `Network`.
+//!
+//! Also the one place the vendored `hello.json` is adapted to this build, for
+//! `fixtures.rs` and `process.rs`.
 
 #![allow(dead_code)]
 
 use std::future::Future;
 use std::net::Ipv4Addr;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use fermix_iroh::VERSION;
 use fermix_iroh::endpoint::{BindScope, Network, Timings};
 use fermix_iroh::protocol::Event;
 use fermix_iroh::session::{self, Exit};
@@ -348,4 +352,26 @@ pub fn expected_preamble(peer: EndpointId) -> [u8; 37] {
     out[4] = 0x01;
     out[5..].copy_from_slice(peer.as_bytes());
     out
+}
+
+/// The `hello` line this build must send: the daemon's `hello.json`, byte for
+/// byte, except the value of `helper_version`, which is this crate's own. The
+/// fixture's value is the daemon's example; the contract pins the field, not
+/// the helper's version.
+pub fn hello_fixture_for_this_build() -> String {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("protocol/fixtures/hello.json");
+    let fixture =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let field = r#""helper_version":""#;
+    assert_eq!(
+        fixture.matches(field).count(),
+        1,
+        "hello.json names {field} exactly once"
+    );
+    let start = fixture.find(field).unwrap() + field.len();
+    let end = start
+        + fixture[start..]
+            .find('"')
+            .expect("helper_version's value is a string");
+    format!("{}{VERSION}{}", &fixture[..start], &fixture[end..])
 }

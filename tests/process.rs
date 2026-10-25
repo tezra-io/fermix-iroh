@@ -3,6 +3,8 @@
 //! network). What happens after `ready` is covered in-process by `session.rs`,
 //! which runs the same session code on loopback.
 
+mod support;
+
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -11,6 +13,7 @@ use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
 use fermix_iroh::protocol::{ErrorCode, Event};
+use fermix_iroh::{IROH_VERSION, VERSION};
 use serde_json::json;
 
 const BIN: &str = env!("CARGO_BIN_EXE_fermix-iroh");
@@ -53,11 +56,11 @@ impl Proc {
             lines,
         };
         let hello = proc.raw_line(HELLO_BOUND).expect("hello within 10 s");
-        let expected = std::fs::read_to_string(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("protocol/fixtures/hello.json"),
-        )
-        .unwrap();
-        assert_eq!(format!("{hello}\n"), expected, "hello is the first line");
+        assert_eq!(
+            format!("{hello}\n"),
+            support::hello_fixture_for_this_build(),
+            "hello is the first line"
+        );
         proc
     }
 
@@ -245,7 +248,7 @@ fn version_flag_answers_and_other_arguments_are_refused() {
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "fermix-iroh 0.1.0 (iroh 1.3.0)\n"
+        format!("fermix-iroh {VERSION} (iroh {IROH_VERSION})\n")
     );
     let out = Command::new(BIN).arg("--serve").output().unwrap();
     assert_eq!(out.status.code(), Some(2));

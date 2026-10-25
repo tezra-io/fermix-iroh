@@ -41,11 +41,11 @@ ends the process.
 `tests/fixtures.rs` holds this crate to those files: every fixture decodes into
 this crate's types and re-encodes to the same bytes, trailing newline included;
 no fixture is left untested; `PROTOCOL_VERSION` is parsed back out of
-`PROTOCOL.md`; the crate's `hello` is `hello.json` byte for byte; the preamble
-for the fixture peer is `bridge_preamble.bin`; and the fixture key (bytes
-`01 02 … 20`) yields the fixture endpoint id. A rename or a type change on
-either side fails CI before it ships, and CI refuses a pull request that edits
-`protocol/` by hand.
+`PROTOCOL.md`; the crate's `hello` is `hello.json` byte for byte, except
+`helper_version`, which is the crate's own; the preamble for the fixture peer
+is `bridge_preamble.bin`; and the fixture key (bytes `01 02 … 20`) yields the
+fixture endpoint id. A rename or a type change on either side fails CI before
+it ships, and CI refuses a pull request that edits `protocol/` by hand.
 
 Where the contract is silent, or iroh 1.3.0 needs more than the contract says to
 meet it, the behaviour chosen is recorded in [`DEVIATIONS.md`](DEVIATIONS.md)
@@ -186,8 +186,7 @@ notices/generate.sh
 `fermix-iroh` and `fermix` are a paired change, as compux and fermix-stt are.
 
 1. Bump the version in `Cargo.toml`, update `CHANGELOG.md`, and, if the wire
-   moved, re-vendor `protocol/` from the engine in the same change. The fixture
-   test fails until `hello.json` names this version.
+   moved, re-vendor `protocol/` from the engine in the same change.
 2. Tag `vX.Y.Z` on `main`. `release.yml` refuses a missing or stale
    `THIRD-PARTY-NOTICES.txt`, builds the four targets, signs and notarizes both
    macOS binaries with the Developer ID certificate (the seven

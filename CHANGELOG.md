@@ -9,7 +9,7 @@ The wire `protocol_version` is versioned separately from this crate; see
 
 ## [Unreleased]
 
-## [0.1.1] - Unreleased
+## [0.1.1] - 2026-10-25
 
 No change in behaviour: the release now also carries the licences of
 everything the binaries are built from.
