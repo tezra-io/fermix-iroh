@@ -9,7 +9,7 @@ use std::time::Duration;
 use fermix_iroh::protocol::{ErrorCode, Event, PathKind, RefusedReason};
 use fermix_iroh::session::Exit;
 use iroh::SecretKey;
-use iroh::endpoint::{ConnectionError, ReadError, VarInt};
+use iroh::endpoint::{ConnectionError, ReadError, ReadToEndError, VarInt};
 use serde_json::json;
 use support::{
     ALPN, Helper, TestRelay, accept_bridge, bounded, dial, expected_preamble, phone, within,
@@ -575,6 +575,16 @@ fn assert_refused(reason: ConnectionError) {
     }
 }
 
+/// The helper reset a stream it would not bridge, with code 0.
+fn assert_reset(read: Result<Vec<u8>, ReadToEndError>) {
+    match read {
+        Err(ReadToEndError::Read(ReadError::Reset(code))) => {
+            assert_eq!(code, VarInt::from_u32(0));
+        }
+        other => panic!("expected a reset with code 0, got {other:?}"),
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn close_ends_a_streamless_connection_of_that_peer_only() {
     bounded(async {
@@ -587,6 +597,16 @@ async fn close_ends_a_streamless_connection_of_that_peer_only() {
         let refused_conn = dial(&refused, helper.endpoint_id(), &relay, ALPN)
             .await
             .unwrap();
+        // The helper knows a connection's peer once it reports the
+        // connection's first path; the daemon only ever closes a peer whose
+        // stream it has seen, so later still.
+        let id = refused.id().to_string();
+        helper
+            .expect(
+                "a path for the refused peer",
+                |e| matches!(e, Event::Path { endpoint_id, .. } if *endpoint_id == id),
+            )
+            .await;
         let other = phone(&relay).await;
         let other_conn = dial(&other, helper.endpoint_id(), &relay, ALPN)
             .await
@@ -596,7 +616,6 @@ async fn close_ends_a_streamless_connection_of_that_peer_only() {
         let (mut unix, _) = accept_bridge(&bridge).await;
         read_some(&mut unix, 2).await;
 
-        let id = refused.id().to_string();
         helper
             .send(&json!({ "op": "close", "endpoint_id": id }))
             .await;
@@ -686,9 +705,10 @@ async fn close_bridges_no_further_stream_and_waits_for_every_open_one() {
         assert_eq!(got, b"bye-1");
 
         // Stream 2 still holds the connection open; a stream opened now is
-        // never bridged.
-        let (mut send3, _recv3) = conn.open_bi().await.unwrap();
+        // reset, never bridged.
+        let (mut send3, mut recv3) = conn.open_bi().await.unwrap();
         send3.write_all(b"three").await.unwrap();
+        assert_reset(within("stream 3's reset", recv3.read_to_end(64)).await);
         unix2.write_all(b"bye-2").await.unwrap();
         drop(unix2);
         let got = within("stream 2's end", recv2.read_to_end(64))
@@ -699,6 +719,49 @@ async fn close_bridges_no_further_stream_and_waits_for_every_open_one() {
         assert_refused(within("the refused close", conn.closed()).await);
         let late = tokio::time::timeout(Duration::from_millis(500), bridge.accept()).await;
         assert!(late.is_err(), "a stream opened after close was bridged");
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_closed_peers_connection_still_ends_when_it_is_lost() {
+    bounded(async {
+        let relay = TestRelay::start().await;
+        let mut helper = Helper::spawn().await;
+        let bridge = helper.listen_bridge();
+        helper.start(&[&relay], 8, &relay).await;
+
+        let phone = phone(&relay).await;
+        let conn = dial(&phone, helper.endpoint_id(), &relay, ALPN)
+            .await
+            .unwrap();
+        let (mut send1, _recv1) = conn.open_bi().await.unwrap();
+        send1.write_all(b"x").await.unwrap();
+        send1.finish().unwrap();
+        let (mut unix, _) = accept_bridge(&bridge).await;
+        let mut upstream = Vec::new();
+        within("the bridge's end of file", unix.read_to_end(&mut upstream))
+            .await
+            .unwrap();
+
+        // Only the daemon's half of stream 1 is left, and the daemon holds it
+        // open; the reset of a new stream shows the close has taken effect.
+        let id = phone.id().to_string();
+        helper
+            .send(&json!({ "op": "close", "endpoint_id": id }))
+            .await;
+        let (mut send2, mut recv2) = conn.open_bi().await.unwrap();
+        send2.write_all(b"y").await.unwrap();
+        assert_reset(within("stream 2's reset", recv2.read_to_end(64)).await);
+
+        phone.close().await;
+        helper
+            .expect(
+                "closed for the lost peer",
+                |e| matches!(e, Event::Closed { endpoint_id } if *endpoint_id == id),
+            )
+            .await;
+        drop(unix);
     })
     .await;
 }

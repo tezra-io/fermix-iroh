@@ -19,7 +19,7 @@ each accepted stream to one connection on a Unix socket the daemon listens on.
 - **Not a trust anchor.** The helper authorizes nothing. Every peer is
   authenticated by the daemon through the mobile protocol's Noise session; the
   iroh endpoint id the helper passes in the preamble is accounting metadata.
-  When a session fails before `hello` or a pair request, the daemon's `close`
+  When a session ends before `hello` or a pair request, the daemon's `close`
   has the helper close that peer's connections once their streams end.
 - **Not a router.** A peer names no socket, host, URL or method. Every stream
   goes to the one bridge socket the daemon named in `start`, and nowhere else.
@@ -75,7 +75,7 @@ stop before the endpoint binds.
 | `tests/framing_props.rs` | property tests: arbitrary bytes never panic the reader or the decoder, no line exceeds 64 KiB, an over-long line is refused |
 | `tests/process.rs` | the binary over real pipes: `hello` first, exit codes, every failure before bind |
 | `tests/relay_tls.rs` | the production relay verifier refuses a chain through a compromised eMudhra intermediate |
-| `tests/session.rs` | end to end over a local relay: preamble, copying both ways, every *Ending* rule, renewal on a second stream, stream credit, ALPN and busy refusals, unreachable bridge, `set_relays`, `close` (the daemon's last bytes first, no further stream, that peer only), `closed`, shutdown within 5 s, end of stdin |
+| `tests/session.rs` | end to end over a local relay: preamble, copying both ways, every *Ending* rule, renewal on a second stream, stream credit, ALPN and busy refusals, unreachable bridge, `set_relays`, `close` (the daemon's last bytes first, later streams reset, that peer only, a lost connection still noticed), `closed`, shutdown within 5 s, end of stdin |
 
 ### The engine's end-to-end test
 

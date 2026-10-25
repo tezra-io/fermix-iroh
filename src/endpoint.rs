@@ -474,8 +474,8 @@ impl Acceptor {
     /// The connection's life: bridge each accepted stream, report each path
     /// change, close it with code 0, reason `idle` once it has had no stream
     /// for `streamless_idle`, with reason `refused` once the daemon closed its
-    /// peer and its open streams have ended (accepting none meanwhile), and on
-    /// shutdown with reason `shutdown`.
+    /// peer and its open streams have ended (resetting every new one
+    /// meanwhile), and on shutdown with reason `shutdown`.
     async fn stream_loop(&self, conn: &Connection, kind: u8, tracker: &mut PathTracker) {
         let peer = conn.remote_id();
         let entry = self.peers.enter(peer);
@@ -497,8 +497,9 @@ impl Acceptor {
                     conn.close(VarInt::from_u32(0), b"refused");
                     return;
                 }
-                accepted = conn.accept_bi(), if !refused => match accepted {
-                    // The daemon closed this peer as the stream arrived.
+                accepted = conn.accept_bi() => match accepted {
+                    // A peer the daemon closed gets no further bridge, even
+                    // for a stream that arrives as the close does.
                     Ok((send, recv)) if entry.refused.is_cancelled() => {
                         bridge::abandon(send, recv);
                         refused = true;

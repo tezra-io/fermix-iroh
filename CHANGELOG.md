@@ -18,11 +18,12 @@ change that moves the engine to version 2. Fixes three findings of the
 
 ### Added
 
-- `close`: when a session fails before `hello` or a pair request, the daemon
-  names the peer, and the helper bridges no further stream from its
-  connections and closes each with code `0`, reason `refused`, once its open
-  streams have ended. A peer could otherwise keep one of `max_connections` by
-  opening stream after stream that fails its handshake.
+- `close`: when a session ends before `hello` or a pair request, the daemon
+  names the peer, and the helper resets every further stream on its
+  connections with code `0` and closes each connection with code `0`, reason
+  `refused`, once its open streams have ended. A peer could otherwise keep one
+  of `max_connections` by opening stream after stream that fails its
+  handshake.
 
 ### Changed
 

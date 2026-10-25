@@ -618,6 +618,15 @@ mod tests {
         ] {
             assert!(validate_endpoint_id(&raw).is_err(), "{raw}");
         }
+        // y = 2 has no x on the curve: hex-shaped, but no public key.
+        let off_curve = format!("02{}", "00".repeat(31));
+        assert_eq!(
+            validate_endpoint_id(&off_curve),
+            Err(RequestError::invalid(
+                "endpoint_id",
+                "not an Ed25519 public key"
+            ))
+        );
     }
 
     #[test]
