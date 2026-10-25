@@ -9,7 +9,7 @@ each accepted stream to one connection on a Unix socket the daemon listens on.
 
 | | |
 |---|---|
-| Wire | NDJSON on stdio, `protocol_version` 1 |
+| Wire | NDJSON on stdio, `protocol_version` 2 |
 | iroh | `=1.3.0`, the `Minimal` preset, the daemon's relays only, no address lookup |
 | Application protocol | `fermix/mobile/1`, a phone; anything else is refused in the TLS handshake |
 | Bridge | one Unix-socket connection per stream: a 37-byte `FXB1` preamble, then the stream's bytes, unparsed |
@@ -19,6 +19,8 @@ each accepted stream to one connection on a Unix socket the daemon listens on.
 - **Not a trust anchor.** The helper authorizes nothing. Every peer is
   authenticated by the daemon through the mobile protocol's Noise session; the
   iroh endpoint id the helper passes in the preamble is accounting metadata.
+  When a session ends before `hello` or a pair request, the daemon's `close`
+  has the helper close that peer's connections once their streams end.
 - **Not a router.** A peer names no socket, host, URL or method. Every stream
   goes to the one bridge socket the daemon named in `start`, and nowhere else.
 - **Not a parser.** It never reads the bytes it copies; they are the daemon's
@@ -34,9 +36,10 @@ each accepted stream to one connection on a Unix socket the daemon listens on.
 
 `protocol/` is the daemon's export (`apps/fermix_core/priv/iroh_helper/` in the
 fermix repository), vendored verbatim: `PROTOCOL.md` plus byte-exact
-`fixtures/*`. **Do not edit anything under `protocol/`.** Fermix defines the
-wire; this repo implements it, and the daemon refuses a mismatched `hello` and
-ends the process.
+`fixtures/*`, everything but the engine's `PIN.json`. `PROTOCOL_SOURCE` holds
+the full id of the fermix commit it was vendored from. **Do not edit anything
+under `protocol/`.** Fermix defines the wire; this repo implements it, and the
+daemon refuses a mismatched `hello` and ends the process.
 
 `tests/fixtures.rs` holds this crate to those files: every fixture decodes into
 this crate's types and re-encodes to the same bytes, trailing newline included;
@@ -45,7 +48,10 @@ no fixture is left untested; `PROTOCOL_VERSION` is parsed back out of
 `helper_version`, which is the crate's own; the preamble for the fixture peer
 is `bridge_preamble.bin`; and the fixture key (bytes `01 02 … 20`) yields the
 fixture endpoint id. A rename or a type change on either side fails CI before
-it ships, and CI refuses a pull request that edits `protocol/` by hand.
+it ships. A pull request that changes `protocol/` or `PROTOCOL_SOURCE` fails CI
+unless `protocol/` holds only regular files that are byte for byte the export
+at the commit `PROTOCOL_SOURCE` names, and that commit is on a branch of
+tezra-io/fermix.
 
 Where the contract is silent, or iroh 1.3.0 needs more than the contract says to
 meet it, the behaviour chosen is recorded in [`DEVIATIONS.md`](DEVIATIONS.md)
@@ -72,7 +78,8 @@ stop before the endpoint binds.
 | `tests/fixtures.rs` | the vendored contract, byte for byte |
 | `tests/framing_props.rs` | property tests: arbitrary bytes never panic the reader or the decoder, no line exceeds 64 KiB, an over-long line is refused |
 | `tests/process.rs` | the binary over real pipes: `hello` first, exit codes, every failure before bind |
-| `tests/session.rs` | end to end over a local relay: preamble, copying both ways, every *Ending* rule, renewal on a second stream, stream credit, ALPN and busy refusals, unreachable bridge, `set_relays`, `closed`, shutdown within 5 s, end of stdin |
+| `tests/relay_tls.rs` | the production relay verifier refuses a chain through a compromised eMudhra intermediate |
+| `tests/session.rs` | end to end over a local relay: preamble, copying both ways, every *Ending* rule, renewal on a second stream, stream credit, ALPN and busy refusals, unreachable bridge, `set_relays`, `close` (the daemon's last bytes first, later streams reset, that peer only, a lost connection still noticed), `closed`, shutdown within 5 s, end of stdin |
 
 ### The engine's end-to-end test
 
@@ -188,14 +195,18 @@ notices/generate.sh
 `fermix-iroh` and `fermix` are a paired change, as compux and fermix-stt are.
 
 1. Bump the version in `Cargo.toml`, update `CHANGELOG.md`, and, if the wire
-   moved, re-vendor `protocol/` from the engine in the same change.
+   moved, re-vendor `protocol/` from the engine in the same change: copy the
+   export at a commit on a fermix branch, and put that commit's full id in
+   `PROTOCOL_SOURCE`.
 2. Tag `vX.Y.Z` on `main`. `release.yml` refuses a missing or stale
    `THIRD-PARTY-NOTICES.txt`, builds the four targets, signs and notarizes both
    macOS binaries with the Developer ID certificate (the seven
    `MACOS_*`/`APPLE_*` secrets are mandatory; the run fails without them),
-   writes a `.sha256` beside every artifact, signs every artifact with cosign
-   (keyless), and waits in the `release` environment for the owner's approval
-   before it publishes anything. The macOS legs first wait in the
+   takes from each build job exactly the files it is expected to make (any
+   other file fails the run, so one job cannot replace another's binary or add
+   its own), writes a `.sha256` beside every artifact, signs every artifact
+   with cosign (keyless), and waits in the `release` environment for the
+   owner's approval before it publishes anything. The macOS legs first wait in the
    `release-signing` environment for the owner's approval, because the signing
    secrets are reachable only there.
 3. Pin the tag, the sha256 values of the binaries and of

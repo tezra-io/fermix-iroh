@@ -9,6 +9,47 @@ The wire `protocol_version` is versioned separately from this crate; see
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-25
+
+Implements `protocol_version` 2, which adds the daemon's `close`. An engine
+that speaks version 1 refuses this helper, so the engine pins it in the same
+change that moves the engine to version 2. Fixes three findings of the
+2026-10-25 security review.
+
+### Added
+
+- `close`: when a session ends before `hello` or a pair request, the daemon
+  names the peer, and the helper resets every further stream on its
+  connections with code `0` and closes each connection with code `0`, reason
+  `refused`, once its open streams have ended. A peer could otherwise keep one
+  of `max_connections` by opening stream after stream that fails its
+  handshake.
+
+### Changed
+
+- A stream the daemon ended counts as open until the peer has acknowledged its
+  last bytes, for at most 5 s, so a connection `close` ends never cuts off the
+  daemon's close frame.
+- CI no longer refuses every pull request that changes `protocol/`, which
+  included each legitimate re-vendor. `PROTOCOL_SOURCE` names the fermix commit
+  `protocol/` comes from, and a pull request that changes either fails unless
+  that commit is on a fermix branch and `protocol/` is its export byte for
+  byte, in regular files only.
+
+### Security
+
+- Relay TLS no longer trusts the eMudhra intermediates whose private keys can
+  be recovered from their certificates (RUSTSEC-2026-0381, RUSTSEC-2026-0382):
+  rustls-webpki 0.103.16 and webpki-roots 1.0.11. webpki-root-certs 1.0.11
+  (RUSTSEC-2026-0383, compiled for no release target) and ctutils 0.4.5
+  (RUSTSEC-2026-0385, whose affected functions iroh never calls) move too.
+  An attacker on the path to a relay could have impersonated it; iroh's own
+  end-to-end authentication kept the phone's traffic private regardless.
+- The release's sign job takes exactly the expected files from each build job,
+  each from its own artifact, and writes every `.sha256` itself. It used to
+  merge every artifact into one directory, where one build job could replace
+  another's binary or add an unsigned file to the release.
+
 ## [0.1.1] - 2026-10-25
 
 No change in behaviour: the release now also carries the licences of
