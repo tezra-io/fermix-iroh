@@ -6187,7 +6187,7 @@ licence's SPDX text, used where a crate ships no copy of its own.
   crypto-common 0.1.7: MIT OR Apache-2.0
   crypto-common 0.2.2: MIT OR Apache-2.0
   ctr 0.9.2: MIT OR Apache-2.0
-  ctutils 0.4.3: Apache-2.0 OR MIT
+  ctutils 0.4.5: Apache-2.0 OR MIT
   curve25519-dalek 5.0.0: BSD-3-Clause
   curve25519-dalek-derive 0.1.1: MIT OR Apache-2.0
   data-encoding 2.11.1: MIT
@@ -6326,7 +6326,7 @@ licence's SPDX text, used where a crate ships no copy of its own.
   rustls-native-certs 0.8.5: Apache-2.0 OR ISC OR MIT
   rustls-pki-types 1.15.1: MIT OR Apache-2.0
   rustls-platform-verifier 0.7.1: MIT OR Apache-2.0
-  rustls-webpki 0.103.15: ISC
+  rustls-webpki 0.103.16: ISC
   rustversion 1.0.23: MIT OR Apache-2.0
   ryu 1.0.23: Apache-2.0 OR BSL-1.0
   security-framework 3.7.0: MIT OR Apache-2.0
@@ -6395,7 +6395,7 @@ licence's SPDX text, used where a crate ships no copy of its own.
   utf8_iter 1.0.4: Apache-2.0 OR MIT
   version_check 0.9.5: MIT OR Apache-2.0
   want 0.3.2: MIT
-  webpki-roots 1.0.9: CDLA-Permissive-2.0
+  webpki-roots 1.0.11: CDLA-Permissive-2.0
   winnow 1.0.4: MIT
   writeable 0.6.4: Unicode-3.0
   xml-rs 0.8.29: MIT
@@ -8015,8 +8015,8 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 --------------------------------------------------------------------------------
 Community Data License Agreement Permissive 2.0 (CDLA-Permissive-2.0)
 
-Text from webpki-roots-1.0.9/LICENSE, used by:
-  webpki-roots 1.0.9
+Text from webpki-roots-1.0.11/LICENSE, used by:
+  webpki-roots 1.0.11
 
 # Community Data License Agreement - Permissive - Version 2.0
 
@@ -8244,8 +8244,8 @@ Copyright 2018 Trent Clarke.
 --------------------------------------------------------------------------------
 ISC License (ISC)
 
-Text from rustls-webpki-0.103.15/LICENSE, used by:
-  rustls-webpki 0.103.15
+Text from rustls-webpki-0.103.16/LICENSE, used by:
+  rustls-webpki 0.103.16
 
 Except as otherwise noted, this project is licensed under the following
 (ISC-style) terms:
@@ -10690,8 +10690,8 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 --------------------------------------------------------------------------------
 MIT License (MIT)
 
-Text from ctutils-0.4.3/LICENSE-MIT, used by:
-  ctutils 0.4.3
+Text from ctutils-0.4.5/LICENSE-MIT, used by:
+  ctutils 0.4.5
 
 Copyright (c) 2025-2026 The RustCrypto Project Developers
 
