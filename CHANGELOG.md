@@ -33,7 +33,8 @@ change that moves the engine to version 2. Fixes three findings of the
 - CI no longer refuses every pull request that changes `protocol/`, which
   included each legitimate re-vendor. `PROTOCOL_SOURCE` names the fermix commit
   `protocol/` comes from, and a pull request that changes either fails unless
-  `protocol/` is that commit's export byte for byte.
+  that commit is on a fermix branch and `protocol/` is its export byte for
+  byte, in regular files only.
 
 ### Security
 

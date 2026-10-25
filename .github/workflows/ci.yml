@@ -59,8 +59,7 @@ jobs:
 
   # protocol/ is the daemon's export, never edited here. A pull request that
   # changes it, or the fermix commit PROTOCOL_SOURCE names, must leave it byte
-  # for byte the export at that commit. PIN.json, the engine's pin of this
-  # helper, stays in the engine.
+  # for byte the export at that commit, which must be on a fermix branch.
   protocol:
     name: protocol export
     if: github.event_name == 'pull_request'
@@ -78,7 +77,7 @@ jobs:
         run: |
           set -euo pipefail
           git fetch --no-tags origin "$BASE_REF"
-          changed="$(git diff --name-only "origin/${BASE_REF}...HEAD" -- protocol/ PROTOCOL_SOURCE)"
+          changed="$(git diff --name-only "origin/${BASE_REF}...HEAD" -- protocol PROTOCOL_SOURCE)"
           if [ -z "$changed" ]; then
             echo "protocol/ and PROTOCOL_SOURCE are unchanged."
             exit 0
@@ -88,13 +87,32 @@ jobs:
             echo "::error::PROTOCOL_SOURCE must hold one full fermix commit id and nothing else."
             exit 1
           fi
+          # Only a change under protocol/ starts this job, so nothing there may
+          # point elsewhere: a link's target could change unchecked.
+          odd="$(find protocol ! -type f ! -type d)"
+          if [ -n "$odd" ]; then
+            echo "::error::protocol/ holds only regular files and directories, not:"
+            printf '%s\n' "$odd"
+            exit 1
+          fi
           fermix="$RUNNER_TEMP/fermix"
           git init -q "$fermix"
           git -C "$fermix" remote add origin https://github.com/tezra-io/fermix.git
+          # GitHub serves a fork's commits by id through its parent, so the
+          # commit must be on a branch of fermix itself. The search reads the
+          # fetched history and never looks the commit up: in a partial clone,
+          # a lookup would fetch a missing commit from the network.
+          git -C "$fermix" fetch -q --filter=tree:0 origin '+refs/heads/*:refs/remotes/origin/*'
+          commits="$(git -C "$fermix" rev-list --remotes=origin)"
+          if ! grep -qx "$source" <<< "$commits"; then
+            echo "::error::fermix ${source} is on no branch of tezra-io/fermix."
+            exit 1
+          fi
           git -C "$fermix" sparse-checkout set --cone "$EXPORT"
-          git -C "$fermix" fetch -q --depth 1 --filter=blob:none origin "$source"
-          git -C "$fermix" checkout -q FETCH_HEAD
-          if ! diff -r --exclude=PIN.json "$fermix/$EXPORT" protocol; then
+          git -C "$fermix" checkout -q "$source"
+          # PIN.json is the engine's pin of this helper, not part of the wire.
+          rm -f "$fermix/$EXPORT/PIN.json"
+          if ! diff -r "$fermix/$EXPORT" protocol; then
             echo "::error::protocol/ is not the daemon's export at fermix ${source}. Re-vendor it from there; never edit it here."
             exit 1
           fi

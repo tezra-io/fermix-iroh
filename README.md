@@ -49,8 +49,9 @@ no fixture is left untested; `PROTOCOL_VERSION` is parsed back out of
 is `bridge_preamble.bin`; and the fixture key (bytes `01 02 … 20`) yields the
 fixture endpoint id. A rename or a type change on either side fails CI before
 it ships. A pull request that changes `protocol/` or `PROTOCOL_SOURCE` fails CI
-unless `protocol/` is byte for byte the export at the commit `PROTOCOL_SOURCE`
-names.
+unless `protocol/` holds only regular files that are byte for byte the export
+at the commit `PROTOCOL_SOURCE` names, and that commit is on a branch of
+tezra-io/fermix.
 
 Where the contract is silent, or iroh 1.3.0 needs more than the contract says to
 meet it, the behaviour chosen is recorded in [`DEVIATIONS.md`](DEVIATIONS.md)
@@ -195,7 +196,7 @@ notices/generate.sh
 
 1. Bump the version in `Cargo.toml`, update `CHANGELOG.md`, and, if the wire
    moved, re-vendor `protocol/` from the engine in the same change: copy the
-   export at a pushed fermix commit, and put that commit's full id in
+   export at a commit on a fermix branch, and put that commit's full id in
    `PROTOCOL_SOURCE`.
 2. Tag `vX.Y.Z` on `main`. `release.yml` refuses a missing or stale
    `THIRD-PARTY-NOTICES.txt`, builds the four targets, signs and notarizes both
