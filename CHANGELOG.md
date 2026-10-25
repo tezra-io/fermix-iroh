@@ -9,6 +9,31 @@ The wire `protocol_version` is versioned separately from this crate; see
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-25
+
+No change in behaviour: the release now also carries the licences of
+everything the binaries are built from.
+
+### Added
+
+- `THIRD-PARTY-NOTICES.txt`, one file for all four targets: fermix-iroh's
+  licence, the Rust project's notice for the standard library, the
+  `LICENSE.TXT` of LLVM 22.1.6's compiler-rt (every binary, through the
+  standard library's compiler_builtins) and libunwind (Linux binaries), musl
+  1.2.5's `COPYRIGHT` (Linux binaries), and every crate a target compiles in
+  with its version, licence expression and licence texts.
+  `notices/generate.sh` writes it with cargo-about 0.9.2 and names the eight
+  crates allowed on a licence's standard text, which the file lists with
+  their authors and repository; `notices/about.toml` accepts exactly the
+  licences in the graph, MPL-2.0 for attohttpc alone, and pins every
+  clarification by checksum. attohttpc's notice names its source on
+  crates.io, with the sha256 `Cargo.lock` pins, and its repository.
+- Every release tarball holds `THIRD-PARTY-NOTICES.txt`, and each release
+  publishes it once as `fermix-iroh-THIRD-PARTY-NOTICES.txt` with a `.sha256`,
+  `.sig` and `.pem`, listed in `SHA256SUMS`.
+- CI regenerates the file and fails when the committed one differs; the
+  release refuses a missing or stale one before it builds.
+
 ## [0.1.0] - 2026-10-23
 
 First version. Implements `protocol_version` 1 against iroh 1.3.0.

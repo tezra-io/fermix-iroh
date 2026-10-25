@@ -19,6 +19,9 @@ env:
   # One toolchain for CI and releases, so a lint never passes in one and fails
   # in the other.
   RUST_TOOLCHAIN: "1.97.1"
+  # notices/generate.sh reads both pins from here; release.yml repeats them and
+  # refuses to release when they differ.
+  CARGO_ABOUT_VERSION: "0.9.2"
 
 jobs:
   # The whole suite is hermetic: the integration tests run iroh's relay server
@@ -65,6 +68,45 @@ jobs:
           if git diff --name-only "origin/${BASE_REF}...HEAD" -- protocol/ | grep -q .; then
             echo "::error::protocol/ is vendored from the fermix daemon and must not be edited here."
             echo "Re-vendor the daemon's export instead, and say so in the PR body."
+            exit 1
+          fi
+
+  # THIRD-PARTY-NOTICES.txt ships in every release. A change to Cargo.lock, the
+  # toolchain or notices/ must regenerate it in the same change.
+  notices:
+    name: third-party notices
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install the toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+
+      - name: Cache cargo-about
+        id: cargo-about
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/cargo-about
+          key: cargo-about-${{ env.CARGO_ABOUT_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+
+      # Built as the release builds it: the workflow's -D warnings is for this
+      # crate, not for cargo-about's dependencies.
+      - name: Install cargo-about
+        if: steps.cargo-about.outputs.cache-hit != 'true'
+        env:
+          RUSTFLAGS: ""
+        run: cargo install --locked --features cli --root ~/.cache/cargo-about "cargo-about@${CARGO_ABOUT_VERSION}"
+
+      - name: Refuse a stale THIRD-PARTY-NOTICES.txt
+        run: |
+          PATH="$HOME/.cache/cargo-about/bin:$PATH" notices/generate.sh
+          if [ -n "$(git status --porcelain -- THIRD-PARTY-NOTICES.txt)" ]; then
+            git diff --stat -- THIRD-PARTY-NOTICES.txt
+            echo "::error::THIRD-PARTY-NOTICES.txt is missing or stale."
+            echo "Run notices/generate.sh and commit the result in this change."
             exit 1
           fi
 

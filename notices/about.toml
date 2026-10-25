@@ -1,0 +1,264 @@
+# cargo-about's configuration for the crates part of THIRD-PARTY-NOTICES.txt.
+# notices/generate.sh runs it; see README "Third-party notices".
+
+# Every crate any release target compiles in, build-time crates included. Tests
+# and examples never ship, so dev-dependencies are left out, and fermix-iroh's
+# own licence heads the file instead of appearing here.
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "aarch64-unknown-linux-musl",
+    "x86_64-unknown-linux-musl",
+]
+ignore-dev-dependencies = true
+private = { ignore = true }
+
+# Exactly the licences the graph needs. Where a crate offers a choice, the
+# first listed wins: MIT, because a crate's LICENSE-MIT carries its copyright
+# line.
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "ISC",
+    "BSD-3-Clause",
+    "BSD-2-Clause",
+    "Unicode-3.0",
+    "Zlib",
+    "CDLA-Permissive-2.0",
+]
+
+# MPL-2.0 for this crate alone, unmodified, through iroh's port mapping
+# (portmapper, igd-next). MPL-2.0 §3.2(a) asks that a binary's Source Code Form
+# be made available and its recipients told how to get it. For this unmodified
+# crate that is the crates.io archive at the version and sha256 the template
+# names with the licence text.
+[attohttpc]
+accepted = ["MPL-2.0"]
+
+# Every clarification below pins the exact text it ships by checksum; a crate
+# update that changes one fails generate.sh until it is reviewed here.
+
+# Code derived from Tailscale, under BSD-3-Clause, alongside iroh's own licence.
+# iroh's crates ship no LICENSE-MIT, so it is read from the commit each was
+# published from (.cargo_vcs_info.json).
+[iroh.clarify]
+license = "(MIT OR Apache-2.0) AND BSD-3-Clause"
+
+[[iroh.clarify.files]]
+path = "LICENSE-BSD3"
+license = "BSD-3-Clause"
+checksum = "7c6c032bf8c84fb4cd99784965a39be9e836fb7f244b3cf40c42faf4b211c10a"
+
+[[iroh.clarify.git]]
+path = "LICENSE-MIT"
+license = "MIT"
+checksum = "f169adb8124d3b005416d8485d00777c9a7bdd9099982c52a4493f9732e6d050"
+
+[iroh-relay.clarify]
+license = "(MIT OR Apache-2.0) AND BSD-3-Clause"
+
+[[iroh-relay.clarify.files]]
+path = "LICENSE-BSD3"
+license = "BSD-3-Clause"
+checksum = "bcaa9acadee6c20991d4b5eb56e226191411a3f6ceb92587b272f2ef0221ed71"
+
+[[iroh-relay.clarify.git]]
+path = "LICENSE-MIT"
+license = "MIT"
+checksum = "f169adb8124d3b005416d8485d00777c9a7bdd9099982c52a4493f9732e6d050"
+
+[iroh-base.clarify]
+license = "MIT OR Apache-2.0"
+
+[[iroh-base.clarify.git]]
+path = "LICENSE-MIT"
+license = "MIT"
+checksum = "f169adb8124d3b005416d8485d00777c9a7bdd9099982c52a4493f9732e6d050"
+
+[iroh-dns.clarify]
+license = "MIT OR Apache-2.0"
+
+[[iroh-dns.clarify.git]]
+path = "LICENSE-MIT"
+license = "MIT"
+checksum = "f169adb8124d3b005416d8485d00777c9a7bdd9099982c52a4493f9732e6d050"
+
+[iroh-metrics-derive.clarify]
+license = "MIT OR Apache-2.0"
+
+[[iroh-metrics-derive.clarify.git]]
+path = "LICENSE-MIT"
+license = "MIT"
+checksum = "339060c99d5c80c2742cae417f765980afe6b0149a78f959bbf2a79f19ab3af5"
+
+[n0-error-macros.clarify]
+license = "MIT OR Apache-2.0"
+
+[[n0-error-macros.clarify.git]]
+path = "LICENSE-MIT"
+license = "MIT"
+checksum = "339060c99d5c80c2742cae417f765980afe6b0149a78f959bbf2a79f19ab3af5"
+
+[netwatch.clarify]
+license = "MIT OR Apache-2.0"
+
+[[netwatch.clarify.git]]
+path = "LICENSE-MIT"
+license = "MIT"
+checksum = "33616ec4c88b6e00de66e6c06f1a55d80bb32a9d7939f3aa83d28e673a1adcae"
+
+[portmapper.clarify]
+license = "MIT OR Apache-2.0"
+
+[[portmapper.clarify.git]]
+path = "LICENSE-MIT"
+license = "MIT"
+checksum = "33616ec4c88b6e00de66e6c06f1a55d80bb32a9d7939f3aa83d28e673a1adcae"
+
+# ring declares "Apache-2.0 AND ISC" and says which code is under which in
+# LICENSE. Code from BoringSSL is Apache-2.0 (LICENSE-BoringSSL), or ISC with
+# the notice at the top of each file: one such notice per copyright holder is
+# shipped, besides ring's own (LICENSE-other-bits), fiat-crypto's, and the
+# Apache-2.0 text of the code ring takes from once_cell. That code's MIT text
+# is outside ring's expression, so cargo-about drops it; the once_cell crate's
+# own block carries the project's MIT text.
+[ring.clarify]
+license = "Apache-2.0 AND ISC"
+
+[[ring.clarify.files]]
+path = "LICENSE"
+license = "ISC"
+checksum = "b3d734001a94efff3579978d953391aa7115f877657d25eb54037a43875d078a"
+
+[[ring.clarify.files]]
+path = "LICENSE-other-bits"
+license = "ISC"
+checksum = "f025ccfb7dfb6bdfedc75ca0f67acc69e6fb4998143d834f7c2f38a29989680f"
+
+[[ring.clarify.files]]
+path = "LICENSE-BoringSSL"
+license = "Apache-2.0"
+checksum = "005fc765ddc5115da796cca915baa9557abae13ff35e0a47c47affc56f6c414d"
+
+[[ring.clarify.files]]
+path = "third_party/fiat/LICENSE"
+license = "Apache-2.0"
+checksum = "9eacbcb81be660840c714a560a9d65ba07913db98dd4baf969f78dd499fdd60f"
+
+[[ring.clarify.files]]
+path = "src/polyfill/once_cell/LICENSE-APACHE"
+license = "Apache-2.0"
+checksum = "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+
+[[ring.clarify.files]]
+path = "crypto/poly1305/poly1305.c"
+license = "ISC"
+checksum = "ed6813e62aea0e5af661f769415dc44e1d316c37487634181661d9c2ea974391"
+start = "Copyright (c) 2014, Google Inc."
+end = "CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE."
+
+[[ring.clarify.files]]
+path = "crypto/fipsmodule/ec/ecp_nistz384.h"
+license = "ISC"
+checksum = "4e622e20d04fd552b8b528b950c08a8125b0c7f934f20a2a1df75f8273a17773"
+start = "Copyright (c) 2014, Intel Corporation."
+end = "CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE."
+
+[[ring.clarify.files]]
+path = "src/debug.rs"
+license = "ISC"
+checksum = "14a67430aef942ebaf72deed89a78834d1725f7c99ebf5cbbad2585a44adeec5"
+start = "Copyright 2018 Trent Clarke."
+end = "CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE."
+
+[[ring.clarify.files]]
+path = "src/digest/sha1.rs"
+license = "ISC"
+checksum = "a56eee0a66e50007cf79d5e29f5995a744cd1b9ca21cd04a9b6819ea81e543bc"
+start = "Copyright 2016 Simon Sapin."
+end = "CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE."
+
+[[ring.clarify.files]]
+path = "src/limb.rs"
+license = "ISC"
+checksum = "b146bcea2f89d2e464f3d9cd13f1126e978c6228539bee216627c6366a05ee17"
+start = "Copyright 2016 David Judd."
+end = "CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE."
+
+# Licence files these crates ship but cargo-about does not recognise.
+[netlink-packet-core.clarify]
+license = "MIT"
+
+[[netlink-packet-core.clarify.files]]
+path = "LICENSE-MIT"
+checksum = "964a53330f9cd970c1790311024281a994644f9b554ff6d37e233672287bf767"
+
+[netlink-proto.clarify]
+license = "MIT"
+
+[[netlink-proto.clarify.files]]
+path = "LICENSE-MIT"
+checksum = "964a53330f9cd970c1790311024281a994644f9b554ff6d37e233672287bf767"
+
+[netlink-sys.clarify]
+license = "MIT"
+
+[[netlink-sys.clarify.files]]
+path = "LICENSE-MIT"
+checksum = "964a53330f9cd970c1790311024281a994644f9b554ff6d37e233672287bf767"
+
+[sha1_smol.clarify]
+license = "BSD-3-Clause"
+
+[[sha1_smol.clarify.files]]
+path = "LICENSE"
+checksum = "282a21b0710441c364025461a447362daf18f5798a7b72ae2f801a2aa536da51"
+
+# The copyright holders LICENSE refers to.
+[[sha1_smol.clarify.files]]
+path = "AUTHORS"
+checksum = "613ce6df827bdbab4f498700a141548396b6ff26488f263654159ada4b04f78e"
+
+[sync_wrapper.clarify]
+license = "Apache-2.0"
+
+[[sync_wrapper.clarify.files]]
+path = "LICENSE"
+checksum = "0d542e0c8804e39aa7f37eb00da5a762149dc682d7829451287e11b938e94594"
+
+[blake3.clarify]
+license = "CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception"
+
+[[blake3.clarify.files]]
+path = "LICENSE_A2"
+license = "Apache-2.0"
+checksum = "00fcc7a934ddbc9ece2a7cc063ac788e284b703b1d705ccbba72d462aa97921e"
+
+[constant_time_eq.clarify]
+license = "CC0-1.0 OR MIT-0 OR Apache-2.0"
+
+[[constant_time_eq.clarify.files]]
+path = "LICENSE-APACHE"
+license = "Apache-2.0"
+checksum = "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a"
+
+[ryu.clarify]
+license = "Apache-2.0 OR BSL-1.0"
+
+[[ryu.clarify.files]]
+path = "LICENSE-APACHE"
+license = "Apache-2.0"
+checksum = "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a"
+
+# The notice for code parking took from the Rust project.
+[parking.clarify]
+license = "Apache-2.0 OR MIT"
+
+[[parking.clarify.files]]
+path = "LICENSE-MIT"
+license = "MIT"
+checksum = "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
+
+[[parking.clarify.files]]
+path = "LICENSE-THIRD-PARTY"
+checksum = "9a6d7a3c1b8edcc706c4b6c37f8dae9a77f02c7f9051df603f975db136b55419"

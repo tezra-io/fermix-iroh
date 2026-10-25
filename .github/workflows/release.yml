@@ -7,8 +7,10 @@ name: release
 #
 # Artifacts per target: the bare binary `fermix-iroh-<asset>` (what the engine's
 # release build pins and bundles) and `fermix-iroh-<version>-<asset>.tar.gz`
-# (binary, LICENSE, README), each with `.sha256`, `.sig` and `.pem`, plus one
-# `SHA256SUMS`.
+# (binary, LICENSE, README, THIRD-PARTY-NOTICES.txt). Once for all targets:
+# `fermix-iroh-THIRD-PARTY-NOTICES.txt`, which the engine bundles beside the
+# binary. Each has a `.sha256`, `.sig` and `.pem`, and there is one
+# `SHA256SUMS`. The release refuses a missing or stale notices file.
 #
 # macOS signing is mandatory: the build fails if any of these secrets is
 # missing, never publishing an unsigned binary:
@@ -38,12 +40,13 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_TOOLCHAIN: "1.97.1"
+  CARGO_ABOUT_VERSION: "0.9.2"
 
 jobs:
   preflight:
     name: preflight
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -67,6 +70,72 @@ jobs:
             echo "::error::CHANGELOG.md has no dated entry for ${version}"
             exit 1
           }
+
+      # A dry run checks out the tag it names, and a tag cut before the notices
+      # has no generator for the steps below.
+      - name: The tag carries notices/generate.sh
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          [ -f notices/generate.sh ] || {
+            echo "::error::$TAG predates THIRD-PARTY-NOTICES.txt, which this workflow builds and signs; dry-run v0.1.1 or later."
+            exit 1
+          }
+
+      # notices/generate.sh reads both pins from ci.yml, and the release builds
+      # with these: notices for another Rust would name the wrong standard
+      # library, musl and LLVM.
+      - name: ci.yml pins the toolchain and cargo-about this release builds with
+        run: |
+          set -euo pipefail
+          for pin in RUST_TOOLCHAIN CARGO_ABOUT_VERSION; do
+            ci="$(sed -n "s/^  $pin: \"\(.*\)\"\$/\1/p" .github/workflows/ci.yml)"
+            [ "$ci" = "${!pin}" ] || {
+              echo "::error::ci.yml pins $pin to ${ci:-nothing} and release.yml to ${!pin}; notices/generate.sh reads ci.yml's, so make them one."
+              exit 1
+            }
+          done
+
+      - name: Install the toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+
+      # Built from source, never restored from a cache: this job decides what
+      # the release ships.
+      - name: Install cargo-about
+        run: cargo install --locked --features cli --root "$RUNNER_TEMP/cargo-about" "cargo-about@${CARGO_ABOUT_VERSION}"
+
+      - name: Refuse a missing or stale THIRD-PARTY-NOTICES.txt
+        run: |
+          set -euo pipefail
+          PATH="$RUNNER_TEMP/cargo-about/bin:$PATH" notices/generate.sh
+          if [ -n "$(git status --porcelain -- THIRD-PARTY-NOTICES.txt)" ]; then
+            git diff --stat -- THIRD-PARTY-NOTICES.txt
+            echo "::error::THIRD-PARTY-NOTICES.txt is missing or stale; regenerate it on main and cut a new version."
+            exit 1
+          fi
+
+      # The engine's pin script takes non-empty UTF-8 text and a one-line
+      # `<sha256>  <name>` sidecar, as for each bare binary.
+      - name: Package the notices
+        run: |
+          set -euo pipefail
+          [ -s THIRD-PARTY-NOTICES.txt ] || { echo "::error::THIRD-PARTY-NOTICES.txt is empty"; exit 1; }
+          iconv -f UTF-8 -t UTF-8 THIRD-PARTY-NOTICES.txt > /dev/null || {
+            echo "::error::THIRD-PARTY-NOTICES.txt is not UTF-8"
+            exit 1
+          }
+          mkdir dist
+          cp THIRD-PARTY-NOTICES.txt dist/fermix-iroh-THIRD-PARTY-NOTICES.txt
+          (cd dist && sha256sum fermix-iroh-THIRD-PARTY-NOTICES.txt > fermix-iroh-THIRD-PARTY-NOTICES.txt.sha256)
+          cat dist/*.sha256
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: build-notices
+          path: dist/*
+          if-no-files-found: error
 
   build:
     name: ${{ matrix.target }}
@@ -208,7 +277,7 @@ jobs:
           bare="fermix-iroh-${ASSET}"
           mkdir -p "dist/${name}"
           cp "$BIN" "dist/${name}/fermix-iroh"
-          cp LICENSE README.md "dist/${name}/"
+          cp LICENSE README.md THIRD-PARTY-NOTICES.txt "dist/${name}/"
           tar -C dist -czf "dist/${name}.tar.gz" "${name}"
           rm -rf "dist/${name}"
           cp "$BIN" "dist/${bare}"
@@ -258,9 +327,10 @@ jobs:
           cd dist
           artifacts=(fermix-iroh-macos-aarch64 fermix-iroh-macos-x86_64 \
                      fermix-iroh-linux-aarch64 fermix-iroh-linux-x86_64 \
+                     fermix-iroh-THIRD-PARTY-NOTICES.txt \
                      fermix-iroh-*.tar.gz)
-          [ "${#artifacts[@]}" -eq 8 ] || {
-            echo "::error::Expected four binaries and four tarballs, found ${#artifacts[@]}"
+          [ "${#artifacts[@]}" -eq 9 ] || {
+            echo "::error::Expected four binaries, the notices and four tarballs, found ${#artifacts[@]}"
             exit 1
           }
           for artifact in "${artifacts[@]}"; do
@@ -318,8 +388,11 @@ jobs:
             echo "## Pinning this release in the engine"
             echo
             echo "The engine's release build bundles the bare \`fermix-iroh-<target>\`"
-            echo "binaries. Pin this tag, each binary's sha256 from \`SHA256SUMS\` below"
-            echo "(not the tarball's), and the signing identity:"
+            echo "binaries and, beside them, \`fermix-iroh-THIRD-PARTY-NOTICES.txt\`: the"
+            echo "licences of everything compiled into them, one file for all four targets"
+            echo "(each tarball carries the same file as \`THIRD-PARTY-NOTICES.txt\`). Pin"
+            echo "this tag, the sha256 of each binary and of the notices from \`SHA256SUMS\`"
+            echo "below (not the tarballs'), and the signing identity:"
             echo
             echo '```'
             echo "https://github.com/${REPO}/.github/workflows/release.yml@refs/tags/${TAG}"

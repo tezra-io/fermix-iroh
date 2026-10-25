@@ -1,0 +1,61 @@
+{{!--
+  The crates part of THIRD-PARTY-NOTICES.txt; notices/generate.sh writes the
+  rest. It replaces each LOCK_SHA256(<name> <version>) with that crate's
+  checksum from Cargo.lock, which cargo metadata does not carry, and each
+  SOURCE_PATH(<path>) with a path that does not depend on this machine's cargo
+  home. Triple braces throughout: the output is plain text, and double braces
+  would escape it as HTML.
+--}}
+================================================================================
+Rust crates
+================================================================================
+
+These {{len crates}} crates are compiled into at least one release target, or
+into building one (build scripts and procedural macros), each under the licence
+shown. The licence texts follow, each with the file it was taken from and the
+crates it covers. A path that starts with <name>-<version>/ is in that crate's
+package; any other is in the package, or the repository at the published
+commit, of a crate listed under it. A text marked "standard text" is the
+licence's SPDX text, used where a crate ships no copy of its own.
+
+{{#each crates}}
+  {{{package.name}}} {{{package.version}}}: {{{license}}}
+{{/each}}
+{{#each licenses}}
+
+--------------------------------------------------------------------------------
+{{{name}}} ({{{id}}}){{#unless source_path}}, standard text{{/unless}}
+{{#unless source_path}}
+
+The crates below ship no copy of this licence, so its standard text follows,
+with a placeholder for the copyright line. Each is listed with the authors and
+repository its Cargo.toml names.
+{{/unless}}
+
+{{#if source_path}}
+Text from SOURCE_PATH({{{source_path}}}), used by:
+{{else}}
+Used by:
+{{/if}}
+{{#each used_by}}
+  {{{crate.name}}} {{{crate.version}}}
+{{#unless ../source_path}}
+    authors:    {{#each crate.authors}}{{#unless @first}}, {{/unless}}{{{this}}}{{else}}none listed{{/each}}
+    repository: {{{crate.repository}}}
+{{/unless}}
+{{/each}}
+{{#if (eq id "MPL-2.0")}}
+
+The binaries carry this crate unmodified. Its Source Code Form is the crate as
+published on crates.io, with the sha256 Cargo.lock pins for it, and its
+repository:
+{{#each used_by}}
+  {{{crate.name}}} {{{crate.version}}}
+    crate:      https://static.crates.io/crates/{{{crate.name}}}/{{{crate.name}}}-{{{crate.version}}}.crate
+    sha256:     LOCK_SHA256({{{crate.name}}} {{{crate.version}}})
+    repository: {{{crate.repository}}}
+{{/each}}
+{{/if}}
+
+{{{text}}}
+{{/each}}

@@ -6,11 +6,13 @@
 //! crate's preamble for the fixture peer; and the fixture key must yield the
 //! fixture endpoint id.
 
+mod support;
+
 use std::path::{Path, PathBuf};
 
+use fermix_iroh::IROH_VERSION;
 use fermix_iroh::bridge::preamble;
 use fermix_iroh::protocol::{Event, KIND_PHONE, Op, PROTOCOL_VERSION, decode_op};
-use fermix_iroh::{IROH_VERSION, VERSION};
 use iroh::SecretKey;
 
 const EVENT_FIXTURES: &[&str] = &[
@@ -119,12 +121,26 @@ fn no_fixture_is_left_untested() {
 }
 
 #[test]
-fn this_build_says_hello_exactly_as_the_fixture_does() {
-    // The fixture names helper 0.1.0 and iroh 1.3.0; a release that moves
-    // either must re-vendor the daemon's export in the same change.
-    assert_eq!(VERSION, "0.1.0");
-    let line = Event::hello().to_line().unwrap();
-    assert_eq!(line, fixture("hello.json"));
+fn this_build_says_hello_as_the_fixture_does() {
+    // The fixture's wire and iroh versions are this build's; a release that
+    // moves either must re-vendor the daemon's export in the same change. Its
+    // helper_version is the daemon's example, so this build's own goes there.
+    let line = one_line("hello.json", &fixture("hello.json"));
+    let Event::Hello {
+        protocol_version,
+        iroh_version,
+        ..
+    } = serde_json::from_str(&line).unwrap()
+    else {
+        panic!("hello.json is not a hello");
+    };
+    assert_eq!(protocol_version, PROTOCOL_VERSION);
+    assert_eq!(iroh_version, IROH_VERSION);
+    let hello = Event::hello().to_line().unwrap();
+    assert_eq!(
+        String::from_utf8(hello).unwrap(),
+        support::hello_fixture_for_this_build()
+    );
 }
 
 #[test]

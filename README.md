@@ -41,11 +41,11 @@ ends the process.
 `tests/fixtures.rs` holds this crate to those files: every fixture decodes into
 this crate's types and re-encodes to the same bytes, trailing newline included;
 no fixture is left untested; `PROTOCOL_VERSION` is parsed back out of
-`PROTOCOL.md`; the crate's `hello` is `hello.json` byte for byte; the preamble
-for the fixture peer is `bridge_preamble.bin`; and the fixture key (bytes
-`01 02 … 20`) yields the fixture endpoint id. A rename or a type change on
-either side fails CI before it ships, and CI refuses a pull request that edits
-`protocol/` by hand.
+`PROTOCOL.md`; the crate's `hello` is `hello.json` byte for byte, except
+`helper_version`, which is the crate's own; the preamble for the fixture peer
+is `bridge_preamble.bin`; and the fixture key (bytes `01 02 … 20`) yields the
+fixture endpoint id. A rename or a type change on either side fails CI before
+it ships, and CI refuses a pull request that edits `protocol/` by hand.
 
 Where the contract is silent, or iroh 1.3.0 needs more than the contract says to
 meet it, the behaviour chosen is recorded in [`DEVIATIONS.md`](DEVIATIONS.md)
@@ -113,7 +113,8 @@ package supports; building them locally needs `musl-tools` (`musl-gcc`) and
   build fetches the bare `fermix-iroh-<target>` binaries of one pinned tag,
   checks each against the `.sha256` sidecar and the cosign signature, and puts
   the helper in every release tree: the app-engine tarballs (and so the Mac
-  app's notarized bundle), the formula, and the Linux packages.
+  app's notarized bundle), the formula, and the Linux packages. Beside it goes
+  `fermix-iroh-THIRD-PARTY-NOTICES.txt`, fetched and checked the same way.
 - **Pinned, not ranged.** The engine pins a tag, each target's sha256, and the
   signing identity
   `https://github.com/tezra-io/fermix-iroh/.github/workflows/release.yml@refs/tags/<tag>`.
@@ -124,22 +125,81 @@ package supports; building them locally needs `musl-tools` (`musl-gcc`) and
   within 10 s, sends `start`, and treats any exit other than the contract's as
   a crash.
 
+## Third-party notices
+
+The four binaries compile in about 260 crates between them and the Rust
+standard library, whose compiler_builtins carries LLVM's compiler-rt builtins
+into every binary, and the Linux ones also link musl libc and LLVM's libunwind;
+their licences ask for their notices to travel with the binary.
+[`THIRD-PARTY-NOTICES.txt`](THIRD-PARTY-NOTICES.txt) carries them, one file for
+all four targets: this crate's licence, the Rust project's notice for the
+standard library, musl's `COPYRIGHT` (Linux only), the `LICENSE.TXT` of
+compiler-rt and of libunwind (Linux only), then every crate a target compiles
+in (build scripts and procedural macros included) with its version, licence
+expression and licence texts. Every tarball holds it, and each release
+publishes it once as `fermix-iroh-THIRD-PARTY-NOTICES.txt`, signed like the
+binaries.
+
+It is generated, never edited by hand, with the toolchain and cargo-about that
+`ci.yml` pins (`RUST_TOOLCHAIN`, `CARGO_ABOUT_VERSION`):
+
+```sh
+rustup toolchain install 1.97.1 --profile minimal
+cargo install --locked --features cli cargo-about@0.9.2
+notices/generate.sh
+```
+
+| File | What it holds |
+|---|---|
+| `notices/generate.sh` | writes the file: `LICENSE`, the toolchain's `share/doc/rust/COPYRIGHT-library.html` as text, musl's `COPYRIGHT`, LLVM's two `LICENSE.TXT`, then cargo-about's part; it also names the crates allowed on a licence's standard text |
+| `notices/about.toml` | the four targets, exactly the licences the graph needs, and checksum-pinned clarifications where a crate's packaged licence files need them |
+| `notices/about.hbs` | the crates part: an index of every crate, then each licence text with the file it was taken from and the crates it covers |
+| `notices/musl-1.2.5-COPYRIGHT` | musl's notice, verbatim, for the musl Rust 1.97.1 bundles and the Linux binaries link |
+| `notices/llvm-22.1.6-libunwind-LICENSE.TXT`, `notices/llvm-22.1.6-compiler-rt-LICENSE.TXT` | LLVM's licence for each, verbatim, from the llvm-project commit Rust 1.97.1 builds them from (the same as `llvmorg-22.1.6`) |
+
+- **Fails loud.** The script refuses another cargo-about version, a toolchain
+  it has no musl and LLVM for, and any cargo-about warning: to cargo-about, a
+  clarification whose checksum no longer matches is only a warning.
+- **Standard text by name only.** A crate that packages no licence file gets
+  the licence's standard text, whose copyright line is a placeholder, and
+  cargo-about does that without a word. Seven crates from the objc2
+  repository and enum-assoc package none, and upstream has none with a
+  copyright line to clarify from; `generate.sh` lists them in
+  `standard_text_crates`, and the file names each one's authors and
+  repository. The script refuses any other crate on a standard text, and a
+  listed one that no longer is.
+- **Refused when stale.** CI regenerates the file on every change and fails if
+  it differs from the committed one, and so does the release, so a change to
+  `Cargo.lock`, `RUST_TOOLCHAIN` or `notices/` regenerates it in the same
+  change. A toolchain bump also means checking which musl and LLVM that Rust
+  bundles.
+- **One MPL-2.0 crate.** attohttpc, through iroh's port mapping, is MPL-2.0,
+  accepted for it alone. MPL-2.0 §3.2(a) asks that a binary's Source Code Form
+  be made available and its recipients told how to get it. The binaries carry
+  the crate unmodified, so its Source Code Form is the crates.io archive at the
+  version and sha256 its notice names (the sha256 `Cargo.lock` pins), and the
+  notice names its repository too.
+- **Network.** Generating reads crate sources through cargo, and fetches the
+  `LICENSE-MIT` a few iroh crates leave out of their package from GitHub, at
+  the commit each was published from.
+
 ## Releasing
 
 `fermix-iroh` and `fermix` are a paired change, as compux and fermix-stt are.
 
 1. Bump the version in `Cargo.toml`, update `CHANGELOG.md`, and, if the wire
-   moved, re-vendor `protocol/` from the engine in the same change. The fixture
-   test fails until `hello.json` names this version.
-2. Tag `vX.Y.Z` on `main`. `release.yml` builds the four targets, signs and
-   notarizes both macOS binaries with the Developer ID certificate (the seven
+   moved, re-vendor `protocol/` from the engine in the same change.
+2. Tag `vX.Y.Z` on `main`. `release.yml` refuses a missing or stale
+   `THIRD-PARTY-NOTICES.txt`, builds the four targets, signs and notarizes both
+   macOS binaries with the Developer ID certificate (the seven
    `MACOS_*`/`APPLE_*` secrets are mandatory; the run fails without them),
    writes a `.sha256` beside every artifact, signs every artifact with cosign
    (keyless), and waits in the `release` environment for the owner's approval
    before it publishes anything. The macOS legs first wait in the
    `release-signing` environment for the owner's approval, because the signing
    secrets are reachable only there.
-3. Pin the tag, the per-target sha256 values from `SHA256SUMS` and the signing
+3. Pin the tag, the sha256 values of the binaries and of
+   `fermix-iroh-THIRD-PARTY-NOTICES.txt` from `SHA256SUMS`, and the signing
    identity in the engine by a normal PR. Never hand-write a checksum.
 4. **Never re-run a published tag's release.** A rebuilt binary does not hash
    the same, so every engine pinning that tag would refuse it. Cut a new version.
@@ -179,4 +239,5 @@ in test builds.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE). What the binaries are built from, and under which
+licences, is in [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt).
