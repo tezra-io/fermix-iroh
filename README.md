@@ -193,9 +193,11 @@ notices/generate.sh
    `THIRD-PARTY-NOTICES.txt`, builds the four targets, signs and notarizes both
    macOS binaries with the Developer ID certificate (the seven
    `MACOS_*`/`APPLE_*` secrets are mandatory; the run fails without them),
-   writes a `.sha256` beside every artifact, signs every artifact with cosign
-   (keyless), and waits in the `release` environment for the owner's approval
-   before it publishes anything. The macOS legs first wait in the
+   takes from each build job exactly the files it is expected to make (any
+   other file fails the run, so one job cannot replace another's binary or add
+   its own), writes a `.sha256` beside every artifact, signs every artifact
+   with cosign (keyless), and waits in the `release` environment for the
+   owner's approval before it publishes anything. The macOS legs first wait in the
    `release-signing` environment for the owner's approval, because the signing
    secrets are reachable only there.
 3. Pin the tag, the sha256 values of the binaries and of
