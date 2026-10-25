@@ -7,16 +7,16 @@
 //!
 //! Decoding is strict. A line that is not a JSON object, an unknown `op`, a
 //! missing field, an unknown field or a field of the wrong type is a decode
-//! error; a well-typed `start` or `set_relays` whose values are out of range is
-//! a validation error. Both end the helper with `bad_request`.
+//! error; a well-typed `start`, `set_relays` or `close` whose values are out of
+//! range is a validation error. Both end the helper with `bad_request`.
 
 use std::path::{Path, PathBuf};
 
-use iroh::RelayUrl;
+use iroh::{EndpointId, RelayUrl};
 use serde::{Deserialize, Serialize};
 
 /// The single integer version carried in `hello`. Pinned to `protocol/PROTOCOL.md`.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// The longest control line, in bytes, not counting its terminating `\n`.
 pub const MAX_LINE_BYTES: usize = 64 * 1024;
@@ -245,6 +245,12 @@ pub enum Op {
         /// The new relay map.
         relays: Vec<RelaySpec>,
     },
+    /// Close a peer's connections once their streams have ended: its session
+    /// failed before `hello` or a pair request.
+    Close {
+        /// The peer's endpoint id, lowercase hex.
+        endpoint_id: String,
+    },
     /// Close everything and exit 0. A struct variant, so an unknown field on it
     /// is refused like on every other op.
     Shutdown {},
@@ -278,6 +284,20 @@ impl RequestError {
 /// Decode one control line (newline already stripped) into an [`Op`].
 pub fn decode_op(line: &str) -> Result<Op, RequestError> {
     serde_json::from_str(line).map_err(|e| RequestError::Malformed(e.to_string()))
+}
+
+/// Validate a peer's endpoint id: 64 lowercase hex digits, as iroh displays it
+/// and the daemon reads it from a preamble, naming an Ed25519 public key.
+pub fn validate_endpoint_id(raw: &str) -> Result<EndpointId, RequestError> {
+    let hex = raw.len() == 64 && raw.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    if !hex {
+        return Err(RequestError::invalid(
+            "endpoint_id",
+            "not 64 lowercase hex digits",
+        ));
+    }
+    raw.parse()
+        .map_err(|_| RequestError::invalid("endpoint_id", "not an Ed25519 public key"))
 }
 
 /// One validated relay: a parsed `https` URL and its QUIC port.
@@ -575,12 +595,28 @@ mod tests {
             "{\"op\":\"set_relays\",\"relays\":[{\"url\":\"https://r/\",\"quic_port\":\"7842\"}]}",
             "{\"op\":\"set_relays\",\"relays\":[{\"url\":\"https://r/\",\"quic_port\":70000}]}",
             "{\"op\":\"set_relays\"}",
+            "{\"op\":\"close\"}",
+            "{\"op\":\"close\",\"endpoint_id\":7}",
             "{\"event\":\"hello\"}",
         ] {
             assert!(
                 matches!(decode_op(line), Err(RequestError::Malformed(_))),
                 "{line:?}"
             );
+        }
+    }
+
+    #[test]
+    fn an_endpoint_id_is_64_lowercase_hex_digits_of_a_public_key() {
+        let id = iroh::SecretKey::from_bytes(&[7; 32]).public();
+        assert_eq!(validate_endpoint_id(&id.to_string()), Ok(id));
+        for raw in [
+            id.to_string().to_uppercase(),
+            id.to_string()[..62].to_string(),
+            format!("{id}00"),
+            format!("{}g", &id.to_string()[..63]),
+        ] {
+            assert!(validate_endpoint_id(&raw).is_err(), "{raw}");
         }
     }
 

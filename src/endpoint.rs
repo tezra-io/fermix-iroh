@@ -5,13 +5,14 @@
 //! service, no proxy is read from the environment, and DNS goes only to the
 //! system's configured nameservers (iroh's public fallback resolvers are turned
 //! off). The daemon's limits become QUIC transport parameters, and the accept
-//! loop refuses a connection over `max_connections` before its handshake.
+//! loop refuses a connection over `max_connections` before its handshake. The
+//! daemon's `close` reaches a peer's connections through [`Acceptor::close_peer`].
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::Ipv4Addr;
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
@@ -23,6 +24,7 @@ use iroh::endpoint::{
 use iroh::tls::CaTlsConfig;
 use iroh::{Endpoint, EndpointId, RelayConfig, RelayMap, RelayMode, RelayUrl, SecretKey};
 use iroh_relay::RelayQuicConfig;
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
@@ -239,18 +241,77 @@ impl Slots {
 }
 
 /// One open stream of a connection; dropping it counts the stream closed.
-struct OpenStream(Arc<AtomicUsize>);
+struct OpenStream(Arc<watch::Sender<usize>>);
 
 impl OpenStream {
-    fn new(streams: &Arc<AtomicUsize>) -> Self {
-        streams.fetch_add(1, Ordering::SeqCst);
+    fn new(streams: &Arc<watch::Sender<usize>>) -> Self {
+        streams.send_modify(|n| *n += 1);
         OpenStream(streams.clone())
     }
 }
 
 impl Drop for OpenStream {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
+        self.0.send_modify(|n| *n -= 1);
+    }
+}
+
+/// Resolves once none of a connection's streams is open.
+async fn no_stream_open(open: &mut watch::Receiver<usize>) {
+    // The loop that waits holds the sender, so the channel cannot close.
+    let _ = open.wait_for(|n| *n == 0).await;
+}
+
+/// The peer of every established connection, so the daemon's `close` can find
+/// a peer's connections.
+#[derive(Default)]
+struct Peers {
+    next: AtomicU64,
+    open: Mutex<HashMap<u64, (EndpointId, CancellationToken)>>,
+}
+
+impl Peers {
+    /// Register one connection of `peer` until the entry is dropped.
+    fn enter(&self, peer: EndpointId) -> PeerEntry<'_> {
+        let key = self.next.fetch_add(1, Ordering::Relaxed);
+        let refused = CancellationToken::new();
+        self.table().insert(key, (peer, refused.clone()));
+        PeerEntry {
+            peers: self,
+            key,
+            refused,
+        }
+    }
+
+    /// Fire the `refused` token of every connection of `peer`.
+    fn refuse(&self, peer: EndpointId) {
+        for (id, refused) in self.table().values() {
+            if *id == peer {
+                refused.cancel();
+            }
+        }
+    }
+
+    fn table(&self) -> MutexGuard<'_, HashMap<u64, (EndpointId, CancellationToken)>> {
+        // A panic ends the process with 101 (see `main`), so no thread ever
+        // sees the lock poisoned.
+        self.open
+            .lock()
+            .expect("the peer table's lock is never poisoned")
+    }
+}
+
+/// One connection's entry in [`Peers`]; dropping it removes the entry.
+struct PeerEntry<'a> {
+    peers: &'a Peers,
+    key: u64,
+    /// Fires when the daemon closes this connection's peer.
+    refused: CancellationToken,
+}
+
+impl Drop for PeerEntry<'_> {
+    fn drop(&mut self) {
+        self.peers.table().remove(&self.key);
     }
 }
 
@@ -258,6 +319,7 @@ impl Drop for OpenStream {
 pub struct Acceptor {
     endpoint: Endpoint,
     slots: Arc<Slots>,
+    peers: Peers,
     timings: Timings,
     socket: Arc<Path>,
     sink: EventSink,
@@ -291,6 +353,7 @@ impl Acceptor {
                 active: AtomicUsize::new(0),
                 max: cfg.limits.max_connections,
             }),
+            peers: Peers::default(),
             timings,
             socket: Arc::from(cfg.bridge_socket.as_path()),
             sink,
@@ -332,6 +395,13 @@ impl Acceptor {
                 }
             }
         }
+    }
+
+    /// The daemon's `close`: bridge no further stream from `peer`'s
+    /// connections, and close each with code 0, reason `refused`, once its
+    /// open streams have ended. A peer with no connection has nothing to close.
+    pub fn close_peer(&self, peer: EndpointId) {
+        self.peers.refuse(peer);
     }
 
     async fn refused(&self, reason: RefusedReason, endpoint_id: Option<String>) {
@@ -403,12 +473,17 @@ impl Acceptor {
 
     /// The connection's life: bridge each accepted stream, report each path
     /// change, close it with code 0, reason `idle` once it has had no stream
-    /// for `streamless_idle`, and on shutdown with code 0, reason `shutdown`.
+    /// for `streamless_idle`, with reason `refused` once the daemon closed its
+    /// peer and its open streams have ended (accepting none meanwhile), and on
+    /// shutdown with reason `shutdown`.
     async fn stream_loop(&self, conn: &Connection, kind: u8, tracker: &mut PathTracker) {
         let peer = conn.remote_id();
+        let entry = self.peers.enter(peer);
         let mut paths = conn.paths_stream();
         let mut paths_open = true;
-        let streams = Arc::new(AtomicUsize::new(0));
+        let (streams, mut open) = watch::channel(0usize);
+        let streams = Arc::new(streams);
+        let mut refused = false;
         let mut idle_since = Some(Instant::now());
         let mut check = tokio::time::interval(self.timings.streamless_idle / 6);
         loop {
@@ -417,7 +492,17 @@ impl Acceptor {
                     conn.close(VarInt::from_u32(0), b"shutdown");
                     return;
                 }
-                accepted = conn.accept_bi() => match accepted {
+                _ = entry.refused.cancelled(), if !refused => refused = true,
+                _ = no_stream_open(&mut open), if refused => {
+                    conn.close(VarInt::from_u32(0), b"refused");
+                    return;
+                }
+                accepted = conn.accept_bi(), if !refused => match accepted {
+                    // The daemon closed this peer as the stream arrived.
+                    Ok((send, recv)) if entry.refused.is_cancelled() => {
+                        bridge::abandon(send, recv);
+                        refused = true;
+                    }
                     Ok((send, recv)) => {
                         idle_since = None;
                         self.spawn_bridge(send, recv, peer, kind, OpenStream::new(&streams));
@@ -425,7 +510,7 @@ impl Acceptor {
                     Err(_) => return,
                 },
                 _ = check.tick() => {
-                    if streams.load(Ordering::SeqCst) > 0 {
+                    if *open.borrow() > 0 {
                         idle_since = None;
                     } else if idle_since.get_or_insert_with(Instant::now).elapsed()
                         >= self.timings.streamless_idle
@@ -513,11 +598,25 @@ mod tests {
 
     #[test]
     fn an_open_stream_is_counted_until_dropped() {
-        let streams = Arc::new(AtomicUsize::new(0));
+        let (streams, open) = watch::channel(0usize);
+        let streams = Arc::new(streams);
         let one = OpenStream::new(&streams);
         let two = OpenStream::new(&streams);
-        assert_eq!(streams.load(Ordering::SeqCst), 2);
+        assert_eq!(*open.borrow(), 2);
         drop((one, two));
-        assert_eq!(streams.load(Ordering::SeqCst), 0);
+        assert_eq!(*open.borrow(), 0);
+    }
+
+    #[test]
+    fn a_refusal_reaches_every_connection_of_that_peer_and_no_other() {
+        let peers = Peers::default();
+        let a = iroh::SecretKey::from_bytes(&[1; 32]).public();
+        let b = iroh::SecretKey::from_bytes(&[2; 32]).public();
+        let (a1, a2, b1) = (peers.enter(a), peers.enter(a), peers.enter(b));
+        peers.refuse(a);
+        assert!(a1.refused.is_cancelled() && a2.refused.is_cancelled());
+        assert!(!b1.refused.is_cancelled());
+        drop((a1, a2, b1));
+        assert!(peers.table().is_empty());
     }
 }

@@ -4,6 +4,7 @@
 //! |---|---|---|
 //! | `start` | validate, read the key, bind, answer `ready` | `bad_request` |
 //! | `set_relays` | `bad_request` | replace the relay map |
+//! | `close` | `bad_request` | close the peer's connections once their streams end |
 //! | `shutdown`, or end of stdin | exit 0 | graceful shutdown, exit 0 within 5 s |
 //! | a framing or decode error | `bad_request` | `bad_request` |
 //!
@@ -22,7 +23,8 @@ use crate::endpoint::{self, AcceptEnd, Acceptor, Network, RelayTable};
 use crate::key;
 use crate::ndjson::{EventSink, EventWriter, LineError, LineReader};
 use crate::protocol::{
-    ErrorCode, Event, LogLevel, Op, RelaySpec, StartConfig, decode_op, validate_relays,
+    ErrorCode, Event, LogLevel, Op, RelaySpec, StartConfig, decode_op, validate_endpoint_id,
+    validate_relays,
 };
 use crate::shutdown;
 use crate::status;
@@ -88,6 +90,7 @@ enum Input {
 struct Running {
     endpoint: Endpoint,
     relays: RelayTable,
+    acceptor: Arc<Acceptor>,
     stop: CancellationToken,
     tasks: TaskTracker,
     failures: mpsc::Receiver<String>,
@@ -134,6 +137,7 @@ impl Session {
         match op {
             Op::Shutdown {} => Some(self.shutdown().await),
             Op::SetRelays { relays } => self.set_relays(&relays).await,
+            Op::Close { endpoint_id } => self.close_peer(&endpoint_id).await,
             Op::Start {
                 secret_key_path,
                 bridge_socket,
@@ -201,8 +205,9 @@ impl Session {
             stop.clone(),
             tasks.clone(),
         ));
+        let accepting = acceptor.clone();
         tasks.spawn(async move {
-            if acceptor.run().await == AcceptEnd::EndpointClosed {
+            if accepting.run().await == AcceptEnd::EndpointClosed {
                 let message = "the endpoint closed while accepting".to_string();
                 // A full or closed channel means a failure is already pending
                 // or the session has ended; either way this one is redundant.
@@ -212,6 +217,7 @@ impl Session {
         Running {
             endpoint,
             relays: RelayTable::new(&cfg.relays),
+            acceptor,
             stop,
             tasks,
             failures,
@@ -236,6 +242,23 @@ impl Session {
             .replace(&running.endpoint, &relays)
             .await
             .map_err(|e| (ErrorCode::Internal, e))
+    }
+
+    async fn close_peer(&mut self, endpoint_id: &str) -> Option<Exit> {
+        match self.refuse_peer(endpoint_id) {
+            Ok(()) => None,
+            Err(message) => Some(self.fail(ErrorCode::BadRequest, &message).await),
+        }
+    }
+
+    /// Validate `endpoint_id` and have that peer's connections closed.
+    fn refuse_peer(&self, endpoint_id: &str) -> Result<(), String> {
+        let Some(running) = self.running.as_ref() else {
+            return Err("close before ready".into());
+        };
+        let peer = validate_endpoint_id(endpoint_id).map_err(|e| e.to_string())?;
+        running.acceptor.close_peer(peer);
+        Ok(())
     }
 
     async fn shutdown(&mut self) -> Exit {

@@ -26,7 +26,12 @@ const EVENT_FIXTURES: &[&str] = &[
     "error.json",
 ];
 
-const OP_FIXTURES: &[&str] = &["start.json", "set_relays.json", "shutdown.json"];
+const OP_FIXTURES: &[&str] = &[
+    "start.json",
+    "set_relays.json",
+    "close.json",
+    "shutdown.json",
+];
 
 const FIXTURE_ENDPOINT_ID: &str =
     "79b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664";

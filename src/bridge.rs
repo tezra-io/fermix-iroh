@@ -8,7 +8,7 @@
 //! | The first thing that happens | What the helper does |
 //! |---|---|
 //! | the peer finishes the stream | shuts down the bridge's write half; keeps copying the daemon's bytes until it closes |
-//! | the daemon closes the bridge | finishes the stream and stops reading it; closes the bridge |
+//! | the daemon closes the bridge | finishes the stream and stops reading it; closes the bridge; waits up to 5 s for the peer to acknowledge the stream's last bytes |
 //! | the peer resets the stream, or the connection is lost | closes the bridge (and resets the stream's send side, code 0) |
 //! | the peer stops reading the stream | closes the bridge (contract silent; see `DEVIATIONS.md`) |
 //! | the bridge socket cannot be reached | resets the stream with code 2, reports `refused` `bridge_unreachable`; no retry |
@@ -45,6 +45,11 @@ pub const ABANDON_CODE: u32 = 0;
 
 /// How long connecting to the bridge and writing the preamble may take.
 pub const CONNECT_DEADLINE: Duration = Duration::from_secs(5);
+
+/// How long a stream the daemon ended waits for the peer to acknowledge its
+/// last bytes. Until then it counts as open, so the connection a `close` ends
+/// is not closed under the daemon's close frame.
+pub const ACK_DEADLINE: Duration = Duration::from_secs(5);
 
 /// The bridge preamble for a peer of `kind` whose endpoint id is `peer`.
 pub fn preamble(kind: u8, peer: &[u8; 32]) -> [u8; PREAMBLE_LEN] {
@@ -233,7 +238,7 @@ async fn copy_down(
         let n = match read {
             Ok(n) if n > 0 => n,
             // EOF or a read error: either way the daemon closed the bridge.
-            Ok(_) | Err(_) => return finish_down(&mut send),
+            Ok(_) | Err(_) => return finish_down(&mut send, halt).await,
         };
         let wrote = tokio::select! {
             _ = halt.cancelled() => return reset_down(&mut send),
@@ -247,15 +252,31 @@ async fn copy_down(
     }
 }
 
-fn finish_down(send: &mut SendStream) -> DownEnd {
+/// Finish the stream, then wait for the peer to acknowledge every byte of it,
+/// for at most [`ACK_DEADLINE`] or until this is stopped. A connection closed
+/// while stream data is unacknowledged discards it.
+async fn finish_down(send: &mut SendStream, halt: &CancellationToken) -> DownEnd {
     // noq's only error here is ClosedStream: the send half already ended.
     let _ = send.finish();
+    // Every outcome ends the wait: acknowledged, stopped by the peer, the
+    // connection gone, or the deadline passed. None is the daemon's business.
+    tokio::select! {
+        _ = halt.cancelled() => {}
+        _ = tokio::time::timeout(ACK_DEADLINE, send.stopped()) => {}
+    }
     DownEnd::BridgeClosed
 }
 
 fn reset_down(send: &mut SendStream) -> DownEnd {
     reset(send, ABANDON_CODE);
     DownEnd::Cancelled
+}
+
+/// End a stream the helper does not bridge: reset its send half and stop
+/// reading it, both with code 0.
+pub fn abandon(mut send: SendStream, mut recv: RecvStream) {
+    reset(&mut send, ABANDON_CODE);
+    stop(&mut recv, ABANDON_CODE);
 }
 
 fn reset(send: &mut SendStream, code: u32) {

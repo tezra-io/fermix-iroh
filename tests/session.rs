@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use fermix_iroh::protocol::{ErrorCode, Event, PathKind, RefusedReason};
 use fermix_iroh::session::Exit;
+use iroh::SecretKey;
 use iroh::endpoint::{ConnectionError, ReadError, VarInt};
 use serde_json::json;
 use support::{
@@ -559,6 +560,184 @@ async fn a_second_start_and_a_bad_set_relays_are_bad_requests() {
         let (exit, took) = helper.exit().await;
         assert_eq!(exit, Exit::Fatal);
         assert!(took < Duration::from_secs(2), "exit 1 took {took:?}");
+    })
+    .await;
+}
+
+/// The close the daemon's `close` op gives a connection.
+fn assert_refused(reason: ConnectionError) {
+    match reason {
+        ConnectionError::ApplicationClosed(close) => {
+            assert_eq!(close.error_code, VarInt::from_u32(0));
+            assert_eq!(&close.reason[..], b"refused");
+        }
+        other => panic!("expected the refused close, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn close_ends_a_streamless_connection_of_that_peer_only() {
+    bounded(async {
+        let relay = TestRelay::start().await;
+        let mut helper = Helper::spawn().await;
+        let bridge = helper.listen_bridge();
+        helper.start(&[&relay], 8, &relay).await;
+
+        let refused = phone(&relay).await;
+        let refused_conn = dial(&refused, helper.endpoint_id(), &relay, ALPN)
+            .await
+            .unwrap();
+        let other = phone(&relay).await;
+        let other_conn = dial(&other, helper.endpoint_id(), &relay, ALPN)
+            .await
+            .unwrap();
+        let (mut send, mut recv) = other_conn.open_bi().await.unwrap();
+        send.write_all(b"hi").await.unwrap();
+        let (mut unix, _) = accept_bridge(&bridge).await;
+        read_some(&mut unix, 2).await;
+
+        let id = refused.id().to_string();
+        helper
+            .send(&json!({ "op": "close", "endpoint_id": id }))
+            .await;
+        // Well before the 30 s streamless bound.
+        assert_refused(within("the refused close", refused_conn.closed()).await);
+
+        // The other peer's connection carries on.
+        unix.write_all(b"still here").await.unwrap();
+        let mut got = [0u8; 10];
+        within("the other peer's bytes", recv.read_exact(&mut got))
+            .await
+            .unwrap();
+        assert_eq!(&got, b"still here");
+        assert!(other_conn.close_reason().is_none());
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn close_lets_the_daemons_last_bytes_through_before_the_connection_ends() {
+    bounded(async {
+        let relay = TestRelay::start().await;
+        let mut helper = Helper::spawn().await;
+        let bridge = helper.listen_bridge();
+        helper.start(&[&relay], 8, &relay).await;
+
+        let phone = phone(&relay).await;
+        let conn = dial(&phone, helper.endpoint_id(), &relay, ALPN)
+            .await
+            .unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        send.write_all(b"handshake").await.unwrap();
+        let (mut unix, _) = accept_bridge(&bridge).await;
+        read_some(&mut unix, 9).await;
+
+        // The daemon refuses the session: `close`, then its close frame, then
+        // the bridge closes. Far more than one packet, so a connection closed
+        // as soon as the stream ends would cut it off.
+        let id = phone.id().to_string();
+        helper
+            .send(&json!({ "op": "close", "endpoint_id": id }))
+            .await;
+        let last: Vec<u8> = (0..128 * 1024).map(|i| (i % 251) as u8).collect();
+        unix.write_all(&last).await.unwrap();
+        drop(unix);
+
+        let got = within("the daemon's last bytes", recv.read_to_end(256 * 1024))
+            .await
+            .expect("every byte arrives before the connection ends");
+        assert_eq!(got.len(), last.len());
+        assert!(got == last, "the last bytes arrived changed");
+        assert_refused(within("the refused close", conn.closed()).await);
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn close_bridges_no_further_stream_and_waits_for_every_open_one() {
+    bounded(async {
+        let relay = TestRelay::start().await;
+        let mut helper = Helper::spawn().await;
+        let bridge = helper.listen_bridge();
+        helper.start(&[&relay], 8, &relay).await;
+
+        let phone = phone(&relay).await;
+        let conn = dial(&phone, helper.endpoint_id(), &relay, ALPN)
+            .await
+            .unwrap();
+        let (mut send1, mut recv1) = conn.open_bi().await.unwrap();
+        send1.write_all(b"one").await.unwrap();
+        let (mut unix1, _) = accept_bridge(&bridge).await;
+        read_some(&mut unix1, 3).await;
+        let (mut send2, mut recv2) = conn.open_bi().await.unwrap();
+        send2.write_all(b"two").await.unwrap();
+        let (mut unix2, _) = accept_bridge(&bridge).await;
+        read_some(&mut unix2, 3).await;
+
+        let id = phone.id().to_string();
+        helper
+            .send(&json!({ "op": "close", "endpoint_id": id }))
+            .await;
+        unix1.write_all(b"bye-1").await.unwrap();
+        drop(unix1);
+        let got = within("stream 1's end", recv1.read_to_end(64))
+            .await
+            .unwrap();
+        assert_eq!(got, b"bye-1");
+
+        // Stream 2 still holds the connection open; a stream opened now is
+        // never bridged.
+        let (mut send3, _recv3) = conn.open_bi().await.unwrap();
+        send3.write_all(b"three").await.unwrap();
+        unix2.write_all(b"bye-2").await.unwrap();
+        drop(unix2);
+        let got = within("stream 2's end", recv2.read_to_end(64))
+            .await
+            .unwrap();
+        assert_eq!(got, b"bye-2");
+
+        assert_refused(within("the refused close", conn.closed()).await);
+        let late = tokio::time::timeout(Duration::from_millis(500), bridge.accept()).await;
+        assert!(late.is_err(), "a stream opened after close was bridged");
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_close_before_ready_or_naming_no_endpoint_id_is_a_bad_request() {
+    bounded(async {
+        let relay = TestRelay::start().await;
+        let id = SecretKey::generate().public().to_string();
+        let ops = [
+            (false, json!({ "op": "close", "endpoint_id": id })),
+            (
+                true,
+                json!({ "op": "close", "endpoint_id": id.to_uppercase() }),
+            ),
+            (true, json!({ "op": "close", "endpoint_id": &id[..62] })),
+            (true, json!({ "op": "close" })),
+        ];
+        for (after_ready, op) in ops {
+            let mut helper = Helper::spawn().await;
+            if after_ready {
+                helper.start(&[&relay], 8, &relay).await;
+            }
+            helper.send(&op).await;
+            let error = helper
+                .expect("an error", |e| matches!(e, Event::Error { .. }))
+                .await;
+            assert!(
+                matches!(
+                    error,
+                    Event::Error {
+                        code: ErrorCode::BadRequest,
+                        ..
+                    }
+                ),
+                "{op}: {error:?}"
+            );
+            assert_eq!(helper.exit().await.0, Exit::Fatal);
+        }
     })
     .await;
 }
