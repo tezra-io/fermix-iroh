@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use fermix_iroh::protocol::{ErrorCode, Event, PathKind, RefusedReason};
 use fermix_iroh::session::Exit;
-use iroh::SecretKey;
-use iroh::endpoint::{ConnectionError, ReadError, ReadToEndError, VarInt};
+use iroh::endpoint::{Connection, ConnectionError, ReadError, ReadToEndError, VarInt};
+use iroh::{Endpoint, SecretKey};
 use serde_json::json;
 use support::{
     ALPN, Helper, TestRelay, accept_bridge, bounded, dial, expected_preamble, phone, within,
@@ -585,6 +585,46 @@ fn assert_reset(read: Result<Vec<u8>, ReadToEndError>) {
     }
 }
 
+/// A streamless connection from a peer of its own, for [`await_closes`].
+struct Barrier {
+    _phone: Endpoint,
+    conn: Connection,
+    id: String,
+}
+
+/// Dial a [`Barrier`] and wait for its first `path`, which shows the helper
+/// knows its connection.
+async fn dial_barrier(helper: &mut Helper, relay: &TestRelay) -> Barrier {
+    let phone = phone(relay).await;
+    let conn = dial(&phone, helper.endpoint_id(), relay, ALPN)
+        .await
+        .unwrap();
+    let id = phone.id().to_string();
+    helper
+        .expect(
+            "a path for the barrier",
+            |e| matches!(e, Event::Path { endpoint_id, .. } if *endpoint_id == id),
+        )
+        .await;
+    Barrier {
+        _phone: phone,
+        conn,
+        id,
+    }
+}
+
+/// Wait until every `close` sent so far has taken effect. The helper reads one
+/// op at a time, and a `close` has refused every connection of its peer before
+/// the next op is read; so once a `close` for the barrier's peer, sent last,
+/// has closed the barrier's streamless connection `refused`, each earlier
+/// `close` has reached every connection it names.
+async fn await_closes(helper: &mut Helper, barrier: &Barrier) {
+    helper
+        .send(&json!({ "op": "close", "endpoint_id": barrier.id }))
+        .await;
+    assert_refused(within("the barrier's refused close", barrier.conn.closed()).await);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn close_ends_a_streamless_connection_of_that_peer_only() {
     bounded(async {
@@ -680,6 +720,7 @@ async fn close_bridges_no_further_stream_and_waits_for_every_open_one() {
         let bridge = helper.listen_bridge();
         helper.start(&[&relay], 8, &relay).await;
 
+        let barrier = dial_barrier(&mut helper, &relay).await;
         let phone = phone(&relay).await;
         let conn = dial(&phone, helper.endpoint_id(), &relay, ALPN)
             .await
@@ -697,6 +738,7 @@ async fn close_bridges_no_further_stream_and_waits_for_every_open_one() {
         helper
             .send(&json!({ "op": "close", "endpoint_id": id }))
             .await;
+        await_closes(&mut helper, &barrier).await;
         unix1.write_all(b"bye-1").await.unwrap();
         drop(unix1);
         let got = within("stream 1's end", recv1.read_to_end(64))
@@ -731,10 +773,19 @@ async fn a_closed_peers_connection_still_ends_when_it_is_lost() {
         let bridge = helper.listen_bridge();
         helper.start(&[&relay], 8, &relay).await;
 
+        let barrier = dial_barrier(&mut helper, &relay).await;
         let phone = phone(&relay).await;
         let conn = dial(&phone, helper.endpoint_id(), &relay, ALPN)
             .await
             .unwrap();
+        // `closed` follows only a connection that reported a `path`.
+        let id = phone.id().to_string();
+        helper
+            .expect(
+                "a path for the phone",
+                |e| matches!(e, Event::Path { endpoint_id, .. } if *endpoint_id == id),
+            )
+            .await;
         let (mut send1, _recv1) = conn.open_bi().await.unwrap();
         send1.write_all(b"x").await.unwrap();
         send1.finish().unwrap();
@@ -745,11 +796,11 @@ async fn a_closed_peers_connection_still_ends_when_it_is_lost() {
             .unwrap();
 
         // Only the daemon's half of stream 1 is left, and the daemon holds it
-        // open; the reset of a new stream shows the close has taken effect.
-        let id = phone.id().to_string();
+        // open; once the close has taken effect, a new stream is reset.
         helper
             .send(&json!({ "op": "close", "endpoint_id": id }))
             .await;
+        await_closes(&mut helper, &barrier).await;
         let (mut send2, mut recv2) = conn.open_bi().await.unwrap();
         send2.write_all(b"y").await.unwrap();
         assert_reset(within("stream 2's reset", recv2.read_to_end(64)).await);
