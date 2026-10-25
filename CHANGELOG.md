@@ -30,6 +30,10 @@ change that moves the engine to version 2. Fixes three findings of the
 - A stream the daemon ended counts as open until the peer has acknowledged its
   last bytes, for at most 5 s, so a connection `close` ends never cuts off the
   daemon's close frame.
+- CI no longer refuses every pull request that changes `protocol/`, which
+  included each legitimate re-vendor. `PROTOCOL_SOURCE` names the fermix commit
+  `protocol/` comes from, and a pull request that changes either fails unless
+  `protocol/` is that commit's export byte for byte.
 
 ### Security
 

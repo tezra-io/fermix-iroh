@@ -36,9 +36,10 @@ each accepted stream to one connection on a Unix socket the daemon listens on.
 
 `protocol/` is the daemon's export (`apps/fermix_core/priv/iroh_helper/` in the
 fermix repository), vendored verbatim: `PROTOCOL.md` plus byte-exact
-`fixtures/*`. **Do not edit anything under `protocol/`.** Fermix defines the
-wire; this repo implements it, and the daemon refuses a mismatched `hello` and
-ends the process.
+`fixtures/*`, everything but the engine's `PIN.json`. `PROTOCOL_SOURCE` holds
+the full id of the fermix commit it was vendored from. **Do not edit anything
+under `protocol/`.** Fermix defines the wire; this repo implements it, and the
+daemon refuses a mismatched `hello` and ends the process.
 
 `tests/fixtures.rs` holds this crate to those files: every fixture decodes into
 this crate's types and re-encodes to the same bytes, trailing newline included;
@@ -47,7 +48,9 @@ no fixture is left untested; `PROTOCOL_VERSION` is parsed back out of
 `helper_version`, which is the crate's own; the preamble for the fixture peer
 is `bridge_preamble.bin`; and the fixture key (bytes `01 02 … 20`) yields the
 fixture endpoint id. A rename or a type change on either side fails CI before
-it ships, and CI refuses a pull request that edits `protocol/` by hand.
+it ships. A pull request that changes `protocol/` or `PROTOCOL_SOURCE` fails CI
+unless `protocol/` is byte for byte the export at the commit `PROTOCOL_SOURCE`
+names.
 
 Where the contract is silent, or iroh 1.3.0 needs more than the contract says to
 meet it, the behaviour chosen is recorded in [`DEVIATIONS.md`](DEVIATIONS.md)
@@ -191,7 +194,9 @@ notices/generate.sh
 `fermix-iroh` and `fermix` are a paired change, as compux and fermix-stt are.
 
 1. Bump the version in `Cargo.toml`, update `CHANGELOG.md`, and, if the wire
-   moved, re-vendor `protocol/` from the engine in the same change.
+   moved, re-vendor `protocol/` from the engine in the same change: copy the
+   export at a pushed fermix commit, and put that commit's full id in
+   `PROTOCOL_SOURCE`.
 2. Tag `vX.Y.Z` on `main`. `release.yml` refuses a missing or stale
    `THIRD-PARTY-NOTICES.txt`, builds the four targets, signs and notarizes both
    macOS binaries with the Developer ID certificate (the seven
