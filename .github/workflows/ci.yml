@@ -92,8 +92,12 @@ jobs:
           path: ~/.cache/cargo-about
           key: cargo-about-${{ env.CARGO_ABOUT_VERSION }}-${{ runner.os }}-${{ runner.arch }}
 
+      # Built as the release builds it: the workflow's -D warnings is for this
+      # crate, not for cargo-about's dependencies.
       - name: Install cargo-about
         if: steps.cargo-about.outputs.cache-hit != 'true'
+        env:
+          RUSTFLAGS: ""
         run: cargo install --locked --features cli --root ~/.cache/cargo-about "cargo-about@${CARGO_ABOUT_VERSION}"
 
       - name: Refuse a stale THIRD-PARTY-NOTICES.txt

@@ -128,15 +128,17 @@ package supports; building them locally needs `musl-tools` (`musl-gcc`) and
 ## Third-party notices
 
 The four binaries compile in about 260 crates between them and the Rust
-standard library, and the Linux ones also link musl libc and LLVM's libunwind
-and compiler-rt; their licences ask for their notices to travel with the
-binary. [`THIRD-PARTY-NOTICES.txt`](THIRD-PARTY-NOTICES.txt) carries them, one
-file for all four targets: this crate's licence, the Rust project's notice for
-the standard library, musl's `COPYRIGHT` and the `LICENSE.TXT` of libunwind and
-compiler-rt (Linux only), then every crate a target compiles in (build scripts
-and procedural macros included) with its version, licence expression and
-licence texts. Every tarball holds it, and each release publishes it once as
-`fermix-iroh-THIRD-PARTY-NOTICES.txt`, signed like the binaries.
+standard library, whose compiler_builtins carries LLVM's compiler-rt builtins
+into every binary, and the Linux ones also link musl libc and LLVM's libunwind;
+their licences ask for their notices to travel with the binary.
+[`THIRD-PARTY-NOTICES.txt`](THIRD-PARTY-NOTICES.txt) carries them, one file for
+all four targets: this crate's licence, the Rust project's notice for the
+standard library, musl's `COPYRIGHT` (Linux only), the `LICENSE.TXT` of
+compiler-rt and of libunwind (Linux only), then every crate a target compiles
+in (build scripts and procedural macros included) with its version, licence
+expression and licence texts. Every tarball holds it, and each release
+publishes it once as `fermix-iroh-THIRD-PARTY-NOTICES.txt`, signed like the
+binaries.
 
 It is generated, never edited by hand, with the toolchain and cargo-about that
 `ci.yml` pins (`RUST_TOOLCHAIN`, `CARGO_ABOUT_VERSION`):

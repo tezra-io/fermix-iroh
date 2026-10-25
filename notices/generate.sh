@@ -25,9 +25,11 @@ fi
 # *-linux-musl targets, not the system's libraries (musl-gcc only compiles
 # ring's and blake3's C): musl's libc and crt objects, built from the musl that
 # src/ci/docker/scripts/musl.sh in rust-lang/rust names, and LLVM's libunwind
-# and compiler-rt crtbegin/crtend, built from the LLVM rustc reports. The
-# aarch64 binary also links compiler-rt's outline atomics, which the standard
-# library builds into compiler_builtins.
+# and compiler-rt crtbegin/crtend, built from the LLVM rustc reports. Every
+# binary also carries compiler-rt's builtins, which the standard library's
+# compiler_builtins compiles from LLVM's sources on every target (the release
+# toolchain's optimized-compiler-builtins), and on both aarch64 targets its
+# outline atomics.
 case "$toolchain" in
   1.97.1) musl=1.2.5 llvm=22.1.6 ;;
   *)
@@ -169,7 +171,14 @@ def source(mark):
     return packaged[1]
 
 
-text = re.sub(r"LOCK_SHA256\((\S+) (\S+)\)", lambda m: sums[(m[1], m[2])], text)
+def checksum(mark):
+    found = sums.get((mark[1], mark[2]))
+    if found is None:
+        sys.exit(f"error: {mark[1]} {mark[2]} has no checksum in Cargo.lock; THIRD-PARTY-NOTICES.txt is unchanged")
+    return found
+
+
+text = re.sub(r"LOCK_SHA256\((\S+) (\S+)\)", checksum, text)
 text = re.sub(r"SOURCE_PATH\((\S+)\)", source, text)
 for mark in ("LOCK_SHA256(", "SOURCE_PATH("):
     if mark in text:
@@ -205,14 +214,17 @@ heading() { printf '%s\n%s\n%s\n\n' "$rule" "$1" "$rule"; }
   echo
   cat "notices/musl-$musl-COPYRIGHT"
   echo
-  heading "LLVM $llvm: libunwind and compiler-rt, in the Linux binaries only"
-  echo "The Linux binaries also link LLVM's libunwind, which unwinds the stack for"
-  echo "panics and backtraces, and compiler-rt's crtbegin and crtend objects, which"
-  echo "Rust $toolchain builds from LLVM $llvm for its *-linux-musl targets. The aarch64"
-  echo "binary also carries compiler-rt's outline atomics (lse.S) and CPU feature"
-  echo "check (cpu_model/aarch64.c), which the standard library builds into"
-  echo "compiler_builtins. Both are licensed under Apache-2.0 WITH LLVM-exception;"
-  echo "the LICENSE.TXT of each follows."
+  heading "LLVM $llvm: compiler-rt in every binary, libunwind in the Linux binaries"
+  echo "The standard library's compiler_builtins crate, licensed under MIT AND"
+  echo "Apache-2.0 WITH LLVM-exception and not named in the Rust project's notice"
+  echo "above, compiles compiler-rt's builtins from LLVM $llvm's sources for every"
+  echo "target, so every binary can carry them; on both aarch64 targets they include"
+  echo "the outline atomics (lse.S) and CPU feature check (cpu_model/aarch64.c). The"
+  echo "Linux binaries also link compiler-rt's crtbegin and crtend objects and LLVM's"
+  echo "libunwind, which unwinds the stack for panics and backtraces, both of which"
+  echo "Rust $toolchain builds from LLVM $llvm for its *-linux-musl targets. compiler-rt"
+  echo "and libunwind are licensed under Apache-2.0 WITH LLVM-exception; the"
+  echo "LICENSE.TXT of each follows."
   echo
   for component in libunwind compiler-rt; do
     printf '%s\n%s/LICENSE.TXT\n\n' "${rule//=/-}" "$component"

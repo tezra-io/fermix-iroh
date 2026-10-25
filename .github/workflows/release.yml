@@ -71,6 +71,17 @@ jobs:
             exit 1
           }
 
+      # A dry run checks out the tag it names, and a tag cut before the notices
+      # has no generator for the steps below.
+      - name: The tag carries notices/generate.sh
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          [ -f notices/generate.sh ] || {
+            echo "::error::$TAG predates THIRD-PARTY-NOTICES.txt, which this workflow builds and signs; dry-run v0.1.1 or later."
+            exit 1
+          }
+
       # notices/generate.sh reads both pins from ci.yml, and the release builds
       # with these: notices for another Rust would name the wrong standard
       # library, musl and LLVM.

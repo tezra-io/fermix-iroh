@@ -5496,16 +5496,19 @@ permissive licensing, and of not having licensing issues being an
 obstacle to adoption, that text has been removed.
 
 ================================================================================
-LLVM 22.1.6: libunwind and compiler-rt, in the Linux binaries only
+LLVM 22.1.6: compiler-rt in every binary, libunwind in the Linux binaries
 ================================================================================
 
-The Linux binaries also link LLVM's libunwind, which unwinds the stack for
-panics and backtraces, and compiler-rt's crtbegin and crtend objects, which
-Rust 1.97.1 builds from LLVM 22.1.6 for its *-linux-musl targets. The aarch64
-binary also carries compiler-rt's outline atomics (lse.S) and CPU feature
-check (cpu_model/aarch64.c), which the standard library builds into
-compiler_builtins. Both are licensed under Apache-2.0 WITH LLVM-exception;
-the LICENSE.TXT of each follows.
+The standard library's compiler_builtins crate, licensed under MIT AND
+Apache-2.0 WITH LLVM-exception and not named in the Rust project's notice
+above, compiles compiler-rt's builtins from LLVM 22.1.6's sources for every
+target, so every binary can carry them; on both aarch64 targets they include
+the outline atomics (lse.S) and CPU feature check (cpu_model/aarch64.c). The
+Linux binaries also link compiler-rt's crtbegin and crtend objects and LLVM's
+libunwind, which unwinds the stack for panics and backtraces, both of which
+Rust 1.97.1 builds from LLVM 22.1.6 for its *-linux-musl targets. compiler-rt
+and libunwind are licensed under Apache-2.0 WITH LLVM-exception; the
+LICENSE.TXT of each follows.
 
 --------------------------------------------------------------------------------
 libunwind/LICENSE.TXT
