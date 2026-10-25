@@ -4,15 +4,17 @@
 
 mod support;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use fermix_iroh::bridge::ACK_DEADLINE;
 use fermix_iroh::protocol::{ErrorCode, Event, PathKind, RefusedReason};
 use fermix_iroh::session::Exit;
 use iroh::endpoint::{Connection, ConnectionError, ReadError, ReadToEndError, VarInt};
 use iroh::{Endpoint, SecretKey};
 use serde_json::json;
 use support::{
-    ALPN, Helper, TestRelay, accept_bridge, bounded, dial, expected_preamble, phone, within,
+    ALPN, Helper, TestRelay, accept_bridge, bounded, dial, expected_preamble, phone,
+    phone_giving_no_credit, within,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -159,6 +161,60 @@ async fn the_daemon_closing_first_finishes_the_stream_and_stops_reading_it() {
             .await
             .expect("the stream outlives the stop");
         assert_eq!(stopped, Some(VarInt::from_u32(0)));
+        // Ending a stream never closes the connection.
+        assert!(conn.close_reason().is_none());
+    })
+    .await;
+}
+
+// A peer can give a stream no flow-control credit. While the daemon's session
+// lives that is backpressure, and the session is the daemon's to end. Once the
+// daemon closes the bridge, the peer has ACK_DEADLINE to take its last bytes
+// and acknowledge them; then the helper resets the stream with code 0, so the
+// peer cannot hold it open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stream_given_no_credit_is_reset_once_the_daemon_has_closed_it() {
+    bounded(async {
+        let relay = TestRelay::start().await;
+        let mut helper = Helper::spawn().await;
+        let bridge = helper.listen_bridge();
+        helper.start(&[&relay], 8, &relay).await;
+
+        let phone = phone_giving_no_credit(&relay).await;
+        let conn = dial(&phone, helper.endpoint_id(), &relay, ALPN)
+            .await
+            .unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        send.write_all(b"hi").await.unwrap();
+        let (mut unix, _) = accept_bridge(&bridge).await;
+        read_some(&mut unix, 2).await;
+
+        // The daemon answers and the peer takes none of it. Past the deadline
+        // the helper has still neither reset the stream nor stopped reading it.
+        unix.write_all(b"handshake reply").await.unwrap();
+        let held = tokio::time::timeout(ACK_DEADLINE + Duration::from_secs(2), async {
+            tokio::select! {
+                reset = recv.received_reset() => format!("reset: {reset:?}"),
+                stopped = send.stopped() => format!("stopped: {stopped:?}"),
+            }
+        })
+        .await;
+        assert!(held.is_err(), "a live session's stream ended: {held:?}");
+
+        // The daemon gives up: its close frame, then the bridge closes.
+        unix.write_all(b"close frame").await.unwrap();
+        let closed_at = Instant::now();
+        drop(unix);
+        let stopped = within("the helper to stop reading", send.stopped())
+            .await
+            .expect("the stream outlives the stop");
+        assert_eq!(stopped, Some(VarInt::from_u32(0)));
+        let reset = within("the stream's reset", recv.received_reset())
+            .await
+            .expect("the stream is reset, not lost");
+        assert_eq!(reset, Some(VarInt::from_u32(0)));
+        let took = closed_at.elapsed();
+        assert!(took >= ACK_DEADLINE, "reset {took:?} after the close");
         // Ending a stream never closes the connection.
         assert!(conn.close_reason().is_none());
     })
@@ -708,6 +764,50 @@ async fn close_lets_the_daemons_last_bytes_through_before_the_connection_ends() 
         assert_eq!(got.len(), last.len());
         assert!(got == last, "the last bytes arrived changed");
         assert_refused(within("the refused close", conn.closed()).await);
+    })
+    .await;
+}
+
+// The hold the 2026-10-25 review found: a peer opens one stream, gives it no
+// flow-control credit and stays silent. At its handshake deadline the daemon
+// writes its close frame, closes the bridge and sends `close`. The helper's
+// write of that frame used to wait forever, so the stream never ended and the
+// connection kept its place for as long as the peer answered keep-alives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn close_ends_the_connection_of_a_peer_that_gives_its_stream_no_credit() {
+    bounded(async {
+        let relay = TestRelay::start().await;
+        let mut helper = Helper::spawn().await;
+        let bridge = helper.listen_bridge();
+        helper.start(&[&relay], 1, &relay).await;
+
+        let stranger = phone_giving_no_credit(&relay).await;
+        let conn = dial(&stranger, helper.endpoint_id(), &relay, ALPN)
+            .await
+            .unwrap();
+        let (mut send, _recv) = conn.open_bi().await.unwrap();
+        send.write_all(b"prelude").await.unwrap();
+        let (mut unix, _) = accept_bridge(&bridge).await;
+        read_some(&mut unix, 7).await;
+
+        unix.write_all(b"close frame").await.unwrap();
+        drop(unix);
+        let id = stranger.id().to_string();
+        helper
+            .send(&json!({ "op": "close", "endpoint_id": id }))
+            .await;
+        assert_refused(within("the refused close", conn.closed()).await);
+        helper
+            .expect(
+                "closed for the stranger",
+                |e| matches!(e, Event::Closed { endpoint_id } if *endpoint_id == id),
+            )
+            .await;
+
+        let next = phone(&relay).await;
+        dial(&next, helper.endpoint_id(), &relay, ALPN)
+            .await
+            .expect("the place the stranger held is free");
     })
     .await;
 }

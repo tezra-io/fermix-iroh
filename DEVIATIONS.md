@@ -129,7 +129,9 @@ iroh connection is lost, the helper closes the bridge connection."
 The contract defines code 2 (bridge unreachable). Every other stream ending the
 helper starts uses code 0: stopping its read side after the daemon closed the
 bridge (`STOP_SENDING` 0), resetting its send side when the stream is
-abandoned after a peer reset or at shutdown (`RESET_STREAM` 0), and both for a
+abandoned after a peer reset or at shutdown, or when the peer has not taken
+and acknowledged the daemon's last bytes 5 s after the daemon closed the
+bridge (`RESET_STREAM` 0), and both for a
 stream that arrives after the daemon's `close` named its peer, which is never
 bridged. After a peer stop, noq answers with a reset carrying the peer's own
 code.

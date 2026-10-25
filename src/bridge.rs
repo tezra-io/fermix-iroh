@@ -8,7 +8,7 @@
 //! | The first thing that happens | What the helper does |
 //! |---|---|
 //! | the peer finishes the stream | shuts down the bridge's write half; keeps copying the daemon's bytes until it closes |
-//! | the daemon closes the bridge | finishes the stream and stops reading it; closes the bridge; then waits up to 5 s for the peer to acknowledge the stream's last bytes |
+//! | the daemon closes the bridge | stops reading the stream; closes the bridge; sends the peer the daemon's last bytes and finishes the stream; resets it, code 0, unless the peer has taken and acknowledged them within 5 s |
 //! | the peer resets the stream, or the connection is lost | closes the bridge (and resets the stream's send side, code 0) |
 //! | the peer stops reading the stream | closes the bridge (contract silent; see `DEVIATIONS.md`) |
 //! | the bridge socket cannot be reached | resets the stream with code 2, reports `refused` `bridge_unreachable`; no retry |
@@ -46,9 +46,10 @@ pub const ABANDON_CODE: u32 = 0;
 /// How long connecting to the bridge and writing the preamble may take.
 pub const CONNECT_DEADLINE: Duration = Duration::from_secs(5);
 
-/// How long a stream the daemon ended waits for the peer to acknowledge its
-/// last bytes. Until then it counts as open, so the connection a `close` ends
-/// is not closed under the daemon's close frame.
+/// How long the peer of a stream the daemon ended has to take the daemon's
+/// last bytes and acknowledge them, before the stream is reset with code 0.
+/// Until then it counts as open, so the connection a `close` ends is not
+/// closed under the daemon's close frame.
 pub const ACK_DEADLINE: Duration = Duration::from_secs(5);
 
 /// The bridge preamble for a peer of `kind` whose endpoint id is `peer`.
@@ -144,10 +145,11 @@ impl UpEnd {
 /// How the daemon-to-peer direction ended. Every ending stops the other
 /// direction: either the daemon closed the bridge, or the stream cannot carry
 /// the daemon's bytes any more.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum DownEnd {
-    /// The daemon closed the bridge: the stream is finished.
-    BridgeClosed,
+    /// The daemon closed the bridge; the peer has yet to take these of its
+    /// bytes.
+    BridgeClosed(Vec<u8>),
     /// The peer stopped reading the stream.
     PeerStopped,
     /// The stream or its connection is gone.
@@ -177,8 +179,8 @@ async fn splice(
     let down = async {
         let end = copy_down(rd, &mut send, &down_stop).await;
         up_stop.cancel();
-        if end == DownEnd::BridgeClosed {
-            await_ack(&send, &down_stop).await;
+        if let DownEnd::BridgeClosed(unsent) = end {
+            send_last(&mut send, &unsent, &down_stop).await;
         }
     };
     tokio::join!(up, down);
@@ -227,50 +229,71 @@ fn stopped_up(recv: &mut RecvStream, end: UpEnd) -> UpEnd {
 }
 
 /// Copy daemon bytes to the peer until the daemon closes or this is stopped.
+///
+/// The bridge is read whenever the buffer has room, also while a write waits
+/// for the peer's flow-control credit, so the daemon's close is seen even
+/// when the peer takes nothing. What the peer has not taken by then comes back
+/// with [`DownEnd::BridgeClosed`]. Both `read` and noq's `write` are cancel
+/// safe, so whichever finishes second loses nothing.
 async fn copy_down(
     mut rd: OwnedReadHalf,
     send: &mut SendStream,
     halt: &CancellationToken,
 ) -> DownEnd {
     let mut buf = vec![0u8; COPY_BUFFER_BYTES];
+    // `buf[sent..filled]` is read from the daemon and not yet taken by the peer.
+    let (mut sent, mut filled) = (0, 0);
     loop {
-        let read = tokio::select! {
+        if sent == filled {
+            (sent, filled) = (0, 0);
+        } else if filled == buf.len() {
+            buf.copy_within(sent..filled, 0);
+            (sent, filled) = (0, filled - sent);
+        }
+        let (held, room) = buf.split_at_mut(filled);
+        let unsent = &held[sent..];
+        tokio::select! {
             _ = halt.cancelled() => return reset_down(send),
-            read = rd.read(&mut buf) => read,
-        };
-        let n = match read {
-            Ok(n) if n > 0 => n,
-            // EOF or a read error: either way the daemon closed the bridge.
-            Ok(_) | Err(_) => return finish_down(send),
-        };
-        let wrote = tokio::select! {
-            _ = halt.cancelled() => return reset_down(send),
-            wrote = send.write_all(&buf[..n]) => wrote,
-        };
-        match wrote {
-            Ok(()) => {}
-            Err(WriteError::Stopped(_)) => return DownEnd::PeerStopped,
-            Err(_) => return DownEnd::StreamLost,
+            read = rd.read(room), if !room.is_empty() => match read {
+                Ok(n) if n > 0 => filled += n,
+                // EOF or a read error: either way the daemon closed the bridge.
+                Ok(_) | Err(_) => return DownEnd::BridgeClosed(unsent.to_vec()),
+            },
+            wrote = send.write(unsent), if !unsent.is_empty() => match wrote {
+                Ok(n) => sent += n,
+                Err(WriteError::Stopped(_)) => return DownEnd::PeerStopped,
+                Err(_) => return DownEnd::StreamLost,
+            },
         }
     }
 }
 
-fn finish_down(send: &mut SendStream) -> DownEnd {
-    // noq's only error here is ClosedStream: the send half already ended.
-    let _ = send.finish();
-    DownEnd::BridgeClosed
-}
-
-/// Wait for the peer to acknowledge every byte of the finished stream, for at
-/// most [`ACK_DEADLINE`] or until this is stopped. The stream counts as open
-/// meanwhile, because a connection closed while stream data is unacknowledged
-/// discards it.
-async fn await_ack(send: &SendStream, halt: &CancellationToken) {
-    // Every outcome ends the wait: acknowledged, stopped by the peer, the
-    // connection gone, or the deadline passed. None is the daemon's business.
-    tokio::select! {
-        _ = halt.cancelled() => {}
-        _ = tokio::time::timeout(ACK_DEADLINE, send.stopped()) => {}
+/// The daemon closed the bridge: send the peer the bytes it has not taken,
+/// finish the stream and wait for the peer to acknowledge every byte of it,
+/// all within [`ACK_DEADLINE`]. A peer that has not by then gets the stream
+/// reset with code 0, as does a stream this is stopped on meanwhile (a peer
+/// reset, a lost stream, shutdown). The stream counts as open until then,
+/// because a connection closed while stream data is unacknowledged discards
+/// it; the deadline keeps a peer that gives the stream no flow-control credit
+/// from holding it open.
+async fn send_last(send: &mut SendStream, unsent: &[u8], halt: &CancellationToken) {
+    let last = async {
+        // A failed write means the peer stopped the stream or the connection
+        // is gone: either way the stream has ended.
+        if send.write_all(unsent).await.is_ok() {
+            // noq's only error here is ClosedStream: the send half already ended.
+            let _ = send.finish();
+            // Acknowledged, stopped by the peer, or the connection gone: each
+            // ends the wait, and none is the daemon's business.
+            let _ = send.stopped().await;
+        }
+    };
+    let ended = tokio::select! {
+        _ = halt.cancelled() => false,
+        ended = tokio::time::timeout(ACK_DEADLINE, last) => ended.is_ok(),
+    };
+    if !ended {
+        reset(send, ABANDON_CODE);
     }
 }
 
