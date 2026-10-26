@@ -68,7 +68,8 @@ pub enum ErrorCode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RefusedReason {
-    /// Over `limits.max_connections`; refused before its handshake.
+    /// Over `limits.max_connections` with no connection that can make way;
+    /// refused before its handshake.
     Busy,
     /// No matching application protocol; refused in the TLS handshake.
     Alpn,
