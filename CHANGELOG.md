@@ -27,12 +27,12 @@ new op or field, so the engine takes it with a pin bump alone.
   `max_connections` place for as long as their peers answered keep-alives.
   Every earlier version had the same hole. The helper now reads the bridge
   while a write waits on the peer, into the same 64 KiB buffer, so it sees the
-  daemon's close at once unless more than 64 KiB of the daemon's bytes are
-  still unsent.
+  daemon's close at once unless 64 KiB or more of the daemon's bytes are still
+  unsent.
 
 ### Changed
 
-- `protocol/` is re-vendored from fermix 39ce571c: the contract states the
+- `protocol/` is re-vendored from fermix b6281f72: the contract states the
   bound above, the `start` example's `max_connections` is 1,024, and the bridge
   section describes the daemon's own bound on bridge connections.
 - Two end-to-end tests of `close` wait until the refusal has reached the
