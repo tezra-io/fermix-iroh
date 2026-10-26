@@ -9,6 +9,45 @@ The wire `protocol_version` is versioned separately from this crate; see
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-10-25
+
+A full helper makes room for a new connection instead of refusing it. Still
+`protocol_version` 2, with no new op, event or field, so the engine takes it
+with a pin bump alone.
+
+### Fixed
+
+- When every `max_connections` place is taken, a new connection takes the
+  place of the connection that has gone longest with no stream open (since it
+  was accepted, or since its last stream ended; one still in its handshake
+  included), which is closed with code `0`, reason `room`, or its handshake
+  dropped. A new connection is refused `busy` only when no connection can make
+  way. A stranger who opened about 26 connections a second with no stream
+  used to hold all 1,024 places, so every phone that reconnected was refused
+  before its handshake, where the daemon's bridge could not make room for it.
+  Keeping a phone out now takes about 200 new connections a second, each with
+  a finished handshake and a stream: the daemon serves 64 streams at once, and
+  a stream it has closed stays open only for the 5 s its peer has to
+  acknowledge. A connection loses its place only while it has no stream open,
+  decided under the lock that counts a stream it accepts, and keeps it while
+  the helper waits for the daemon to read an event about it, so a daemon that
+  stops reading gets `busy` refusals rather than a task left behind per new
+  connection. Making room is reported to the daemon's log as a `log` warning
+  at the 1st, 10th, 100th… time; when the daemon's `close` and a newer
+  connection land together, the close still reads `refused`.
+
+### Changed
+
+- `protocol/` is re-vendored from fermix 40f7910c, whose contract states the
+  rule above.
+- The end-to-end busy test keeps its bridge connection open, so its first
+  connection holds its place by having a stream open, as the rule now
+  requires. The two new end-to-end tests wait for the helper's `path` of the
+  connection that makes way before the next dial: until the helper has
+  finished that handshake, it drops the handshake instead of closing the
+  connection `room`. No test reaches a handshake dropped this way: that needs
+  a peer that stalls mid-handshake, which the harness cannot make yet.
+
 ## [0.2.1] - 2026-10-25
 
 Fixes a stream a peer could hold open by giving it no flow-control credit,
