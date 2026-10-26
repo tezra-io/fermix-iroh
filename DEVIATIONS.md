@@ -186,8 +186,21 @@ must drop or reset its send half, or a renewal will wait for credit.
 ### B9. `max_connections` counts handshaking connections
 
 A connection holds a slot from the moment it is accepted for its handshake
-until its task ends, so `max_connections` bounds handshakes in flight as well as
-established connections. Refused attempts hold no slot.
+until its task ends, or until a full helper gives its slot to a newer
+connection (the contract's `room`), so `max_connections` bounds handshakes in
+flight as well as established connections. Refused attempts hold no slot. Which
+connection has gone longest with no stream open is decided in
+`endpoint::Slots` under the same lock that counts a stream opened, so a
+connection never loses its slot to a newer one while a stream it accepted is
+being counted, nor while its task waits for the daemon to read an event about
+it (`Slot::reporting`): a daemon that stops reading then fills the table and
+the accept loop waits on its `busy` event, as before, instead of each new
+connection leaving another task stalled on the event queue. `max_connections`
+bounds places, not QUIC state: a displaced connection stays in noq's closing
+state for three probe timeouts, and displacement can create those at the rate
+new connections arrive. The helper reports making room to the daemon's log as a
+`log` warning at the 1st, 10th, 100th… time, since a dropped handshake has no
+event and a closed connection only `closed`.
 
 A slot is never held for nothing (adopted in the contract, 2026-10-14, after a
 review): a handshake not finished within 10 s is dropped; a connection that has

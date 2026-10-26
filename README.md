@@ -79,7 +79,7 @@ stop before the endpoint binds.
 | `tests/framing_props.rs` | property tests: arbitrary bytes never panic the reader or the decoder, no line exceeds 64 KiB, an over-long line is refused |
 | `tests/process.rs` | the binary over real pipes: `hello` first, exit codes, every failure before bind |
 | `tests/relay_tls.rs` | the production relay verifier refuses a chain through a compromised eMudhra intermediate |
-| `tests/session.rs` | end to end over a local relay: preamble, copying both ways, every *Ending* rule, renewal on a second stream, stream credit, ALPN and busy refusals, unreachable bridge, `set_relays`, `close` (the daemon's last bytes first, later streams reset, that peer only, a lost connection still noticed, a peer that gives its stream no credit still closed), a stream given no credit reset 5 s after the daemon closes it, `closed`, shutdown within 5 s, end of stdin |
+| `tests/session.rs` | end to end over a local relay: preamble, copying both ways, every *Ending* rule, renewal on a second stream, stream credit, ALPN and busy refusals, a full helper making room for a new connection, unreachable bridge, `set_relays`, `close` (the daemon's last bytes first, later streams reset, that peer only, a lost connection still noticed, a peer that gives its stream no credit still closed), a stream given no credit reset 5 s after the daemon closes it, `closed`, shutdown within 5 s, end of stdin |
 
 ### The engine's end-to-end test
 

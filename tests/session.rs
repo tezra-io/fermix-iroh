@@ -7,7 +7,7 @@ mod support;
 use std::time::{Duration, Instant};
 
 use fermix_iroh::bridge::ACK_DEADLINE;
-use fermix_iroh::protocol::{ErrorCode, Event, PathKind, RefusedReason};
+use fermix_iroh::protocol::{ErrorCode, Event, LogLevel, PathKind, RefusedReason};
 use fermix_iroh::session::Exit;
 use iroh::endpoint::{Connection, ConnectionError, ReadError, ReadToEndError, VarInt};
 use iroh::{Endpoint, SecretKey};
@@ -395,6 +395,7 @@ async fn a_connection_with_no_stream_is_closed_idle_and_frees_its_slot() {
     .await;
 }
 
+// Every place holds a connection with a stream open, so none makes way.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_connection_over_the_limit_is_refused_before_its_handshake() {
     bounded(async {
@@ -409,7 +410,8 @@ async fn a_connection_over_the_limit_is_refused_before_its_handshake() {
             .unwrap();
         let (mut send, _recv) = held.open_bi().await.unwrap();
         send.write_all(b"1").await.unwrap();
-        accept_bridge(&bridge).await;
+        // Held open, so the stream stays open.
+        let _held_bridge = accept_bridge(&bridge).await;
 
         let second = phone(&relay).await;
         let refused = dial(&second, helper.endpoint_id(), &relay, ALPN).await;
@@ -436,6 +438,98 @@ async fn a_connection_over_the_limit_is_refused_before_its_handshake() {
         dial(&third, helper.endpoint_id(), &relay, ALPN)
             .await
             .expect("a slot is free again");
+    })
+    .await;
+}
+
+// Connections that open no stream would otherwise hold every place against a
+// phone that reconnects: when every place is taken, a new connection takes the
+// place of the one that has gone longest with no stream open, which is closed
+// `room`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_new_connection_takes_the_place_of_the_one_silent_longest() {
+    bounded(async {
+        let relay = TestRelay::start().await;
+        let mut helper = Helper::spawn().await;
+        let _bridge = helper.listen_bridge();
+        helper.start(&[&relay], 2, &relay).await;
+
+        let first = phone(&relay).await;
+        let oldest = dial(&first, helper.endpoint_id(), &relay, ALPN)
+            .await
+            .unwrap();
+        handshake_done(&mut helper, &first).await;
+        let second = phone(&relay).await;
+        let newer = dial(&second, helper.endpoint_id(), &relay, ALPN)
+            .await
+            .unwrap();
+
+        let third = phone(&relay).await;
+        let newest = dial(&third, helper.endpoint_id(), &relay, ALPN)
+            .await
+            .expect("a new connection gets a place while one is silent");
+        assert_room(within("the room close", oldest.closed()).await);
+        assert!(newer.close_reason().is_none());
+        assert!(newest.close_reason().is_none());
+        helper
+            .expect("the daemon's log hears of it", |e| {
+                matches!(e, Event::Log { level: LogLevel::Warn, message } if message.starts_with("1 connection(s) closed `room`"))
+            })
+            .await;
+    })
+    .await;
+}
+
+/// Wait until the helper has finished `phone`'s handshake: its `path` is
+/// reported only then. Until it has, a full helper drops the handshake rather
+/// than closing the connection `room`.
+async fn handshake_done(helper: &mut Helper, phone: &Endpoint) {
+    let id = phone.id().to_string();
+    helper
+        .expect(
+            "the helper's side of the handshake",
+            |e| matches!(e, Event::Path { endpoint_id, .. } if *endpoint_id == id),
+        )
+        .await;
+}
+
+// A connection with a stream open never makes way, however old: the place
+// goes from the silent one beside it, and the stream keeps its bridge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_connection_with_a_stream_open_keeps_its_place() {
+    bounded(async {
+        let relay = TestRelay::start().await;
+        let mut helper = Helper::spawn().await;
+        let bridge = helper.listen_bridge();
+        helper.start(&[&relay], 2, &relay).await;
+
+        let first = phone(&relay).await;
+        let busy = dial(&first, helper.endpoint_id(), &relay, ALPN)
+            .await
+            .unwrap();
+        let (mut send, mut recv) = busy.open_bi().await.unwrap();
+        send.write_all(b"in session").await.unwrap();
+        let (mut unix, _) = accept_bridge(&bridge).await;
+        assert_eq!(read_some(&mut unix, 10).await, b"in session");
+
+        let second = phone(&relay).await;
+        let silent = dial(&second, helper.endpoint_id(), &relay, ALPN)
+            .await
+            .unwrap();
+        handshake_done(&mut helper, &second).await;
+        let third = phone(&relay).await;
+        dial(&third, helper.endpoint_id(), &relay, ALPN)
+            .await
+            .expect("the silent connection makes way");
+        assert_room(within("the room close", silent.closed()).await);
+
+        unix.write_all(b"still bridged").await.unwrap();
+        let mut got = [0u8; 13];
+        within("the reply", recv.read_exact(&mut got))
+            .await
+            .unwrap();
+        assert_eq!(&got, b"still bridged");
+        assert!(busy.close_reason().is_none());
     })
     .await;
 }
@@ -628,6 +722,17 @@ fn assert_refused(reason: ConnectionError) {
             assert_eq!(&close.reason[..], b"refused");
         }
         other => panic!("expected the refused close, got {other:?}"),
+    }
+}
+
+/// The close a connection gets when its place goes to a newer one.
+fn assert_room(reason: ConnectionError) {
+    match reason {
+        ConnectionError::ApplicationClosed(close) => {
+            assert_eq!(close.error_code, VarInt::from_u32(0));
+            assert_eq!(&close.reason[..], b"room");
+        }
+        other => panic!("expected the room close, got {other:?}"),
     }
 }
 

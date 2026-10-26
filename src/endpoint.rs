@@ -4,14 +4,16 @@
 //! the relay map is exactly the daemon's list, there is no address lookup
 //! service, no proxy is read from the environment, and DNS goes only to the
 //! system's configured nameservers (iroh's public fallback resolvers are turned
-//! off). The daemon's limits become QUIC transport parameters, and the accept
-//! loop refuses a connection over `max_connections` before its handshake. The
+//! off). The daemon's limits become QUIC transport parameters. When every one
+//! of `max_connections` places is taken, the accept loop gives a new connection
+//! the place of the one that has gone longest with no stream open, and refuses
+//! it before its handshake only when every place has a stream open. The
 //! daemon's `close` reaches a peer's connections through [`Acceptor::close_peer`].
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::Ipv4Addr;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -30,7 +32,9 @@ use tokio_util::task::TaskTracker;
 
 use crate::bridge::{self, StreamContext};
 use crate::ndjson::EventSink;
-use crate::protocol::{Event, RefusedReason, Relay, StartConfig, ValidLimits, kind_for_alpn};
+use crate::protocol::{
+    Event, LogLevel, RefusedReason, Relay, StartConfig, ValidLimits, kind_for_alpn,
+};
 use crate::status::PathTracker;
 
 /// The environment variables that would route iroh's HTTPS relay probes
@@ -208,51 +212,180 @@ impl RelayTable {
     }
 }
 
-/// A taken connection slot; dropping it frees the slot.
-struct Slot(Arc<Slots>);
+/// A connection's place; dropping it frees the place, unless the place was
+/// already given to a newer connection.
+struct Slot {
+    slots: Arc<Slots>,
+    key: u64,
+    /// Fires when the place is given to a newer connection.
+    room: CancellationToken,
+}
+
+impl Slot {
+    /// Keep this place while its task waits for the daemon to read an event. A
+    /// place is given away only while its task waits on its peer, so a daemon
+    /// that stops reading fills the table and the accept loop waits on its
+    /// `busy` event, instead of every new connection leaving another task
+    /// stalled on the event queue.
+    fn reporting(&self) -> Reporting<'_> {
+        self.slots.set_reporting(self.key, true);
+        Reporting(self)
+    }
+}
 
 impl Drop for Slot {
     fn drop(&mut self) {
-        self.0.active.fetch_sub(1, Ordering::SeqCst);
+        self.slots.table().remove(&self.key);
     }
 }
 
-/// The `max_connections` bound: connections from accept to close, handshaking
-/// ones included.
+/// A place kept while its task reports; dropping it lets the place go again.
+struct Reporting<'a>(&'a Slot);
+
+impl Drop for Reporting<'_> {
+    fn drop(&mut self) {
+        self.0.slots.set_reporting(self.0.key, false);
+    }
+}
+
+/// One taken place.
+struct Place {
+    /// The connection's open streams.
+    streams: usize,
+    /// Since when it has had no stream open (its accept, or its last stream's
+    /// end); `None` while one is.
+    silent_since: Option<Instant>,
+    /// Its task waits for the daemon to read an event (see [`Slot::reporting`]).
+    reporting: bool,
+    room: CancellationToken,
+}
+
+/// The `max_connections` bound: connections from accept to close, or until
+/// their place is given away, handshaking ones included. When every place is
+/// taken, a new connection gets the place of the connection that has gone
+/// longest with no stream open, so connections that open no stream cannot keep
+/// a reconnecting phone out; it is refused only when every place has a stream
+/// open or its task is reporting.
 struct Slots {
-    active: AtomicUsize,
     max: usize,
+    next: AtomicU64,
+    places: Mutex<HashMap<u64, Place>>,
 }
 
 impl Slots {
-    fn try_take(self: &Arc<Self>) -> Option<Slot> {
-        let taken = self
-            .active
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-                (n < self.max).then_some(n + 1)
-            });
-        taken.ok().map(|_| Slot(self.clone()))
+    fn new(max: usize) -> Arc<Self> {
+        Arc::new(Slots {
+            max,
+            next: AtomicU64::new(0),
+            places: Mutex::new(HashMap::new()),
+        })
     }
 
-    /// Half the slots or more are taken: new peers must prove their address.
+    /// A place for a connection accepted at `now`: a free one, else the place
+    /// of the connection silent longest, whose `room` then fires (the `bool`
+    /// says so). `None` when every place has a stream open or its task is
+    /// reporting.
+    fn take(self: &Arc<Self>, now: Instant) -> Option<(Slot, bool)> {
+        let mut places = self.table();
+        let made_room = places.len() >= self.max;
+        if made_room {
+            let (_, longest) = places
+                .iter()
+                .filter(|(_, place)| !place.reporting)
+                .filter_map(|(key, place)| place.silent_since.map(|since| (since, *key)))
+                .min()?;
+            if let Some(place) = places.remove(&longest) {
+                place.room.cancel();
+            }
+        }
+        let key = self.next.fetch_add(1, Ordering::Relaxed);
+        let room = CancellationToken::new();
+        places.insert(
+            key,
+            Place {
+                streams: 0,
+                silent_since: Some(now),
+                reporting: false,
+                room: room.clone(),
+            },
+        );
+        let slot = Slot {
+            slots: self.clone(),
+            key,
+            room,
+        };
+        Some((slot, made_room))
+    }
+
+    fn set_reporting(&self, key: u64, reporting: bool) {
+        if let Some(place) = self.table().get_mut(&key) {
+            place.reporting = reporting;
+        }
+    }
+
+    /// Count a stream opened on `key`'s connection, under the same lock that
+    /// gives places away; `false` once its place went to a newer connection.
+    fn stream_opened(&self, key: u64) -> bool {
+        let mut places = self.table();
+        let Some(place) = places.get_mut(&key) else {
+            return false;
+        };
+        place.streams += 1;
+        place.silent_since = None;
+        true
+    }
+
+    fn stream_closed(&self, key: u64, now: Instant) {
+        let mut places = self.table();
+        if let Some(place) = places.get_mut(&key) {
+            place.streams -= 1;
+            if place.streams == 0 {
+                place.silent_since = Some(now);
+            }
+        }
+    }
+
+    /// Half the places or more are taken: new peers must prove their address.
     fn under_pressure(&self) -> bool {
-        self.active.load(Ordering::SeqCst) * 2 >= self.max
+        self.table().len() * 2 >= self.max
+    }
+
+    fn table(&self) -> MutexGuard<'_, HashMap<u64, Place>> {
+        // A panic ends the process with 101 (see `main`), so no thread ever
+        // sees the lock poisoned.
+        self.places
+            .lock()
+            .expect("the place table's lock is never poisoned")
     }
 }
 
 /// One open stream of a connection; dropping it counts the stream closed.
-struct OpenStream(Arc<watch::Sender<usize>>);
+struct OpenStream {
+    streams: Arc<watch::Sender<usize>>,
+    slots: Arc<Slots>,
+    key: u64,
+}
 
 impl OpenStream {
-    fn new(streams: &Arc<watch::Sender<usize>>) -> Self {
+    /// Count a stream open on `slot`'s connection, or `None` once its place
+    /// went to a newer connection.
+    fn new(streams: &Arc<watch::Sender<usize>>, slot: &Slot) -> Option<Self> {
+        if !slot.slots.stream_opened(slot.key) {
+            return None;
+        }
         streams.send_modify(|n| *n += 1);
-        OpenStream(streams.clone())
+        Some(OpenStream {
+            streams: streams.clone(),
+            slots: slot.slots.clone(),
+            key: slot.key,
+        })
     }
 }
 
 impl Drop for OpenStream {
     fn drop(&mut self) {
-        self.0.send_modify(|n| *n -= 1);
+        self.slots.stream_closed(self.key, Instant::now());
+        self.streams.send_modify(|n| *n -= 1);
     }
 }
 
@@ -349,10 +482,7 @@ impl Acceptor {
     ) -> Self {
         Acceptor {
             endpoint,
-            slots: Arc::new(Slots {
-                active: AtomicUsize::new(0),
-                max: cfg.limits.max_connections,
-            }),
+            slots: Slots::new(cfg.limits.max_connections),
             peers: Peers::default(),
             timings,
             socket: Arc::from(cfg.bridge_socket.as_path()),
@@ -364,6 +494,7 @@ impl Acceptor {
 
     /// Accept connections until shutdown or until the endpoint closes.
     pub async fn run(self: Arc<Self>) -> AcceptEnd {
+        let mut made_room: u64 = 0;
         loop {
             let incoming = tokio::select! {
                 _ = self.stop.cancelled() => return AcceptEnd::Stopped,
@@ -383,11 +514,15 @@ impl Acceptor {
             } else {
                 incoming
             };
-            match self.slots.try_take() {
-                Some(slot) => {
+            match self.slots.take(Instant::now()) {
+                Some((slot, displaced)) => {
                     let this = self.clone();
                     self.tasks
                         .spawn(async move { this.serve(incoming, slot).await });
+                    if displaced {
+                        made_room += 1;
+                        self.report_made_room(made_room).await;
+                    }
                 }
                 None => {
                     incoming.refuse();
@@ -413,20 +548,35 @@ impl Acceptor {
             .await;
     }
 
+    /// A full helper makes room silently (a dropped handshake has no event, and
+    /// a closed connection only `closed`), so the daemon's log hears of it at
+    /// the 1st, 10th, 100th… time: a flood of connections that open no stream
+    /// is otherwise invisible.
+    async fn report_made_room(&self, count: u64) {
+        if !worth_reporting(count) {
+            return;
+        }
+        let message = format!(
+            "{count} connection(s) closed `room` so far: the helper was full and each gave its place to a newer one"
+        );
+        self.sink.emit(Event::log(LogLevel::Warn, &message)).await;
+    }
+
     /// Handshake one connection, then bridge its streams until it ends.
-    async fn serve(&self, incoming: Incoming, _slot: Slot) {
-        let Some(conn) = self.handshake(incoming).await else {
+    async fn serve(&self, incoming: Incoming, slot: Slot) {
+        let Some(conn) = self.handshake(incoming, &slot).await else {
             return;
         };
         let Some(kind) = kind_for_alpn(conn.alpn()) else {
             // The server config offers one ALPN, so this cannot happen; refuse
             // rather than guess a kind.
             conn.close(VarInt::from_u32(0), b"alpn");
+            let _kept = slot.reporting();
             self.refused(RefusedReason::Alpn, Some(conn.remote_id().to_string()))
                 .await;
             return;
         };
-        self.serve_streams(&conn, kind).await;
+        self.serve_streams(&conn, kind, &slot).await;
     }
 
     /// Complete the handshake, or report why it was refused. Only a refused
@@ -436,26 +586,32 @@ impl Acceptor {
     /// A handshake in flight when shutdown starts is not abandoned: QUIC can
     /// carry an application close reason only once the handshake is complete,
     /// so it is allowed to finish (shutdown bounds the wait) and the connection
-    /// is then closed with reason `shutdown` like every other.
-    async fn handshake(&self, incoming: Incoming) -> Option<Connection> {
+    /// is then closed with reason `shutdown` like every other. A handshake
+    /// whose place goes to a newer connection (`room`) is dropped at once.
+    async fn handshake(&self, incoming: Incoming, slot: &Slot) -> Option<Connection> {
         // noq reads the ClientHello here, so an ALPN refusal can surface
         // already from `accept`, before there is anything to await.
         let accepting = match incoming.accept() {
             Ok(accepting) => accepting,
-            Err(e) => return self.handshake_failed(&e).await,
+            Err(e) => return self.handshake_failed(&e, slot).await,
         };
-        match tokio::time::timeout(self.timings.handshake_deadline, accepting).await {
+        let finished = tokio::select! {
+            _ = slot.room.cancelled() => return None,
+            finished = tokio::time::timeout(self.timings.handshake_deadline, accepting) => finished,
+        };
+        match finished {
             Ok(Ok(conn)) => Some(conn),
             Ok(Err(ConnectingError::ConnectionError { source, .. })) => {
-                self.handshake_failed(&source).await
+                self.handshake_failed(&source, slot).await
             }
             // Dropping the unfinished handshake ends it and frees the slot.
             Ok(Err(_)) | Err(_) => None,
         }
     }
 
-    async fn handshake_failed(&self, err: &ConnectionError) -> Option<Connection> {
+    async fn handshake_failed(&self, err: &ConnectionError, slot: &Slot) -> Option<Connection> {
         if refused_for_alpn(err) {
+            let _kept = slot.reporting();
             self.refused(RefusedReason::Alpn, None).await;
         }
         None
@@ -463,10 +619,11 @@ impl Acceptor {
 
     /// Accept streams and report path changes until the connection ends or the
     /// helper shuts down; then report `closed` if a `path` was reported.
-    async fn serve_streams(&self, conn: &Connection, kind: u8) {
+    async fn serve_streams(&self, conn: &Connection, kind: u8, slot: &Slot) {
         let mut tracker = PathTracker::new(conn.remote_id());
-        self.stream_loop(conn, kind, &mut tracker).await;
+        self.stream_loop(conn, kind, slot, &mut tracker).await;
         if let Some(event) = tracker.closed() {
+            let _kept = slot.reporting();
             self.sink.emit(event).await;
         }
     }
@@ -475,8 +632,15 @@ impl Acceptor {
     /// change, close it with code 0, reason `idle` once it has had no stream
     /// for `streamless_idle`, with reason `refused` once the daemon closed its
     /// peer and its open streams have ended (resetting every new one
-    /// meanwhile), and on shutdown with reason `shutdown`.
-    async fn stream_loop(&self, conn: &Connection, kind: u8, tracker: &mut PathTracker) {
+    /// meanwhile), with reason `room` once its place went to a newer
+    /// connection, and on shutdown with reason `shutdown`.
+    async fn stream_loop(
+        &self,
+        conn: &Connection,
+        kind: u8,
+        slot: &Slot,
+        tracker: &mut PathTracker,
+    ) {
         let peer = conn.remote_id();
         let entry = self.peers.enter(peer);
         let mut paths = conn.paths_stream();
@@ -488,6 +652,10 @@ impl Acceptor {
         let mut check = tokio::time::interval(self.timings.streamless_idle / 6);
         loop {
             tokio::select! {
+                // In order, so the daemon's `close` (`refused`) wins over
+                // `room` when a refused connection's last stream ends as its
+                // place is given away.
+                biased;
                 _ = self.stop.cancelled() => {
                     conn.close(VarInt::from_u32(0), b"shutdown");
                     return;
@@ -497,6 +665,11 @@ impl Acceptor {
                     conn.close(VarInt::from_u32(0), b"refused");
                     return;
                 }
+                // Only a connection with no stream open loses its place.
+                _ = slot.room.cancelled() => {
+                    conn.close(VarInt::from_u32(0), b"room");
+                    return;
+                }
                 accepted = conn.accept_bi() => match accepted {
                     // A peer the daemon closed gets no further bridge, even
                     // for a stream that arrives as the close does.
@@ -504,10 +677,19 @@ impl Acceptor {
                         bridge::abandon(send, recv);
                         refused = true;
                     }
-                    Ok((send, recv)) => {
-                        idle_since = None;
-                        self.spawn_bridge(send, recv, peer, kind, OpenStream::new(&streams));
-                    }
+                    Ok((send, recv)) => match OpenStream::new(&streams, slot) {
+                        Some(stream) => {
+                            idle_since = None;
+                            self.spawn_bridge(send, recv, peer, kind, stream);
+                        }
+                        // The place went to a newer connection as the stream
+                        // arrived.
+                        None => {
+                            bridge::abandon(send, recv);
+                            conn.close(VarInt::from_u32(0), b"room");
+                            return;
+                        }
+                    },
                     Err(_) => return,
                 },
                 _ = check.tick() => {
@@ -523,6 +705,7 @@ impl Acceptor {
                 snapshot = paths.next(), if paths_open => match snapshot {
                     Some(list) => {
                         if let Some(event) = tracker.observe(&list) {
+                            let _kept = slot.reporting();
                             self.sink.emit(event).await;
                         }
                     }
@@ -554,6 +737,11 @@ impl Acceptor {
     }
 }
 
+/// The 1st, 10th, 100th… of a count: a log that a sustained flood cannot fill.
+fn worth_reporting(count: u64) -> bool {
+    count > 0 && 10u64.pow(count.ilog10()) == count
+}
+
 /// Whether a failed handshake is the TLS handshake refusing every offered ALPN.
 fn refused_for_alpn(err: &ConnectionError) -> bool {
     matches!(
@@ -567,31 +755,86 @@ fn refused_for_alpn(err: &ConnectionError) -> bool {
 mod tests {
     use super::*;
 
+    fn taken(slots: &Arc<Slots>, now: Instant) -> Slot {
+        slots.take(now).expect("a place").0
+    }
+
+    fn at(start: Instant, secs: u64) -> Instant {
+        start + Duration::from_secs(secs)
+    }
+
     #[test]
-    fn slots_refuse_past_the_bound_and_free_on_drop() {
-        let slots = Arc::new(Slots {
-            active: AtomicUsize::new(0),
-            max: 2,
-        });
-        let a = slots.try_take().unwrap();
-        let b = slots.try_take().unwrap();
-        assert!(slots.try_take().is_none());
+    fn slots_refuse_past_the_bound_only_when_every_place_has_a_stream() {
+        let (slots, t) = (Slots::new(2), Instant::now());
+        let a = taken(&slots, t);
+        let b = taken(&slots, at(t, 1));
+        assert!(slots.stream_opened(a.key) && slots.stream_opened(b.key));
+        assert!(slots.take(at(t, 2)).is_none());
+        assert!(!a.room.is_cancelled() && !b.room.is_cancelled());
         drop(a);
-        let c = slots.try_take().unwrap();
-        assert!(slots.try_take().is_none());
+        let c = taken(&slots, at(t, 3));
+        assert!(slots.stream_opened(c.key));
+        assert!(slots.take(at(t, 4)).is_none());
         drop((b, c));
-        assert_eq!(slots.active.load(Ordering::SeqCst), 0);
+        assert!(slots.table().is_empty());
+    }
+
+    #[test]
+    fn a_full_table_gives_away_the_place_silent_longest() {
+        let (slots, t) = (Slots::new(3), Instant::now());
+        // a had a stream until 5 s; b never had one, accepted at 1 s; c has
+        // one open. b has been silent longest, though a was accepted first.
+        let a = taken(&slots, t);
+        let b = taken(&slots, at(t, 1));
+        let c = taken(&slots, at(t, 2));
+        assert!(slots.stream_opened(a.key) && slots.stream_opened(c.key));
+        slots.stream_closed(a.key, at(t, 5));
+        let d = taken(&slots, at(t, 6));
+        assert!(b.room.is_cancelled());
+        assert!(!a.room.is_cancelled() && !c.room.is_cancelled());
+        // b's place is d's: b opens no stream, and dropping b frees nothing.
+        assert!(!slots.stream_opened(b.key));
+        drop(b);
+        assert_eq!(slots.table().len(), 3);
+        // Next silent longest is a, then d; c keeps its stream and its place.
+        let e = taken(&slots, at(t, 7));
+        assert!(a.room.is_cancelled() && !d.room.is_cancelled());
+        let f = taken(&slots, at(t, 8));
+        assert!(d.room.is_cancelled() && !c.room.is_cancelled());
+        drop((a, c, d, e, f));
+        assert!(slots.table().is_empty());
+    }
+
+    #[test]
+    fn a_place_is_kept_while_its_task_reports_and_a_taker_says_it_made_room() {
+        let (slots, t) = (Slots::new(1), Instant::now());
+        let (a, made_room) = slots.take(t).unwrap();
+        assert!(!made_room);
+        let kept = a.reporting();
+        assert!(slots.take(at(t, 1)).is_none());
+        assert!(!a.room.is_cancelled());
+        drop(kept);
+        let (b, made_room) = slots.take(at(t, 2)).unwrap();
+        assert!(made_room && a.room.is_cancelled());
+        // A displaced place's guard changes nothing of the newcomer's.
+        drop(a.reporting());
+        assert!(!slots.table()[&b.key].reporting);
+    }
+
+    #[test]
+    fn displacement_is_reported_at_each_power_of_ten() {
+        let reported: Vec<u64> = (0..=1_000).filter(|n| worth_reporting(*n)).collect();
+        assert_eq!(reported, [1, 10, 100, 1_000]);
+        assert!(worth_reporting(10_000_000_000_000_000_000));
+        assert!(!worth_reporting(u64::MAX));
     }
 
     #[test]
     fn addresses_are_validated_once_half_the_slots_are_taken() {
-        let slots = Arc::new(Slots {
-            active: AtomicUsize::new(0),
-            max: 4,
-        });
-        let a = slots.try_take().unwrap();
+        let (slots, t) = (Slots::new(4), Instant::now());
+        let a = taken(&slots, t);
         assert!(!slots.under_pressure());
-        let b = slots.try_take().unwrap();
+        let b = taken(&slots, t);
         assert!(slots.under_pressure());
         drop((a, b));
         assert!(!slots.under_pressure());
@@ -599,13 +842,19 @@ mod tests {
 
     #[test]
     fn an_open_stream_is_counted_until_dropped() {
+        let slots = Slots::new(1);
+        let slot = taken(&slots, Instant::now());
         let (streams, open) = watch::channel(0usize);
         let streams = Arc::new(streams);
-        let one = OpenStream::new(&streams);
-        let two = OpenStream::new(&streams);
+        let one = OpenStream::new(&streams, &slot).unwrap();
+        let two = OpenStream::new(&streams, &slot).unwrap();
         assert_eq!(*open.borrow(), 2);
-        drop((one, two));
+        assert_eq!(slots.table()[&slot.key].silent_since, None);
+        drop(one);
+        assert_eq!(slots.table()[&slot.key].silent_since, None);
+        drop(two);
         assert_eq!(*open.borrow(), 0);
+        assert!(slots.table()[&slot.key].silent_since.is_some());
     }
 
     #[test]
