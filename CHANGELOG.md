@@ -9,6 +9,38 @@ The wire `protocol_version` is versioned separately from this crate; see
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-25
+
+Fixes a stream a peer could hold open by giving it no flow-control credit,
+found by a review of 0.2.0 on 2026-10-25. Still `protocol_version` 2, with no
+new op or field, so the engine takes it with a pin bump alone.
+
+### Fixed
+
+- Once the daemon closes the bridge, the peer has at most 5 s to take what the
+  daemon wrote and acknowledge it, whatever flow-control credit it gives; the
+  helper then resets the stream with code `0`. The 5 s used to cover only the
+  acknowledgement: sending the daemon's last bytes waited on the peer's credit
+  with no bound, so a peer that gave a stream none and stayed silent held the
+  stream open, and neither `close` nor the 30 s idle bound closed its
+  connection. 1,024 such connections, opened once, held every
+  `max_connections` place for as long as their peers answered keep-alives.
+  Every earlier version had the same hole. The helper now reads the bridge
+  while a write waits on the peer, into the same 64 KiB buffer, so it sees the
+  daemon's close at once unless 64 KiB or more of the daemon's bytes are still
+  unsent.
+
+### Changed
+
+- `protocol/` is re-vendored from fermix b6281f72: the contract states the
+  bound above, the `start` example's `max_connections` is 1,024, and the bridge
+  section describes the daemon's own bound on bridge connections.
+- Two end-to-end tests of `close` wait until the refusal has reached the
+  connection before they open the next stream, and the relay TLS test accepts
+  only the eMudhra intermediates' distrust, not an unknown issuer.
+- The release dry run's refusal of a tag without notices names v0.2.0, not
+  v0.1.1, which was never tagged.
+
 ## [0.2.0] - 2026-10-25
 
 Implements `protocol_version` 2, which adds the daemon's `close`. An engine
@@ -28,8 +60,8 @@ change that moves the engine to version 2. Fixes three findings of the
 ### Changed
 
 - A stream the daemon ended counts as open until the peer has acknowledged its
-  last bytes, for at most 5 s, so a connection `close` ends never cuts off the
-  daemon's close frame.
+  last bytes, for at most 5 s, so when `close` ends a connection, the daemon's
+  close frame is never cut off.
 - CI no longer refuses every pull request that changes `protocol/`, which
   included each legitimate re-vendor. `PROTOCOL_SOURCE` names the fermix commit
   `protocol/` comes from, and a pull request that changes either fails unless

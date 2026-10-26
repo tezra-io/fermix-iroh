@@ -43,16 +43,14 @@ fn the_production_verifier_refuses_a_chain_through_a_compromised_emudhra_interme
     let refused = verifier
         .verify_server_cert(&leaf, &intermediates, &name, &[], now)
         .expect_err("a chain through a compromised eMudhra intermediate is refused");
-    // Either fix refuses it: rustls-webpki >= 0.103.16 distrusts the
-    // intermediates (an `Other` error rustls 0.23 has no variant for), and
-    // webpki-roots >= 1.0.10 no longer carries the emSign root. Anything else
-    // means the fixture went stale rather than the chain being distrusted.
-    let distrusted = match &refused {
-        Error::InvalidCertificate(CertificateError::UnknownIssuer) => true,
-        Error::InvalidCertificate(CertificateError::Other(other)) => {
-            format!("{other:?}").contains("CertDistrusted")
-        }
-        _ => false,
-    };
+    // rustls-webpki >= 0.103.16 distrusts the intermediates, an `Other` error
+    // rustls 0.23 has no variant for. Anything else means the chain no longer
+    // reaches that check (an unknown issuer, say, once webpki-roots drops the
+    // emSign root), so this test would no longer show the distrust holds.
+    let distrusted = matches!(
+        &refused,
+        Error::InvalidCertificate(CertificateError::Other(other))
+            if format!("{other:?}").contains("CertDistrusted")
+    );
     assert!(distrusted, "refused for another reason: {refused:?}");
 }

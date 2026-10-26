@@ -21,7 +21,7 @@ use fermix_iroh::VERSION;
 use fermix_iroh::endpoint::{BindScope, Network, Timings};
 use fermix_iroh::protocol::Event;
 use fermix_iroh::session::{self, Exit};
-use iroh::endpoint::{Connection, PortmapperConfig, presets};
+use iroh::endpoint::{Builder, Connection, PortmapperConfig, QuicTransportConfig, VarInt, presets};
 use iroh::tls::CaTlsConfig;
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey};
 use serde_json::json;
@@ -305,6 +305,20 @@ fn rand_bytes() -> [u8; 32] {
 
 /// A phone-side endpoint using only `relay`, bound to loopback.
 pub async fn phone(relay: &TestRelay) -> Endpoint {
+    bind_phone(phone_builder(relay)).await
+}
+
+/// A phone-side endpoint like [`phone`] that gives every stream no
+/// flow-control credit: its stream receive window is 0, so the helper can
+/// send nothing on a stream it opens, and reading grants none.
+pub async fn phone_giving_no_credit(relay: &TestRelay) -> Endpoint {
+    let transport = QuicTransportConfig::builder()
+        .stream_receive_window(VarInt::from_u32(0))
+        .build();
+    bind_phone(phone_builder(relay).transport_config(transport)).await
+}
+
+fn phone_builder(relay: &TestRelay) -> Builder {
     Endpoint::builder(presets::Minimal)
         .relay_mode(RelayMode::Custom(relay.map.clone()))
         .ca_tls_config(CaTlsConfig::insecure_skip_verify())
@@ -312,9 +326,10 @@ pub async fn phone(relay: &TestRelay) -> Endpoint {
         .clear_ip_transports()
         .bind_addr((Ipv4Addr::LOCALHOST, 0))
         .expect("a loopback bind address")
-        .bind()
-        .await
-        .expect("the phone endpoint binds")
+}
+
+async fn bind_phone(builder: Builder) -> Endpoint {
+    builder.bind().await.expect("the phone endpoint binds")
 }
 
 /// Dial the helper at `relay` only, offering `alpn`.

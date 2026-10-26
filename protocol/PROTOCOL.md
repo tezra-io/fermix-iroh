@@ -107,7 +107,7 @@ helper                                   daemon
 ## Ops the daemon sends
 
 ```json
-{"op":"start","secret_key_path":"/Users/owner/.fermix/mobile/iroh_key","bridge_socket":"/Users/owner/.fermix/mobile/bridge.sock","alpn":"fermix/mobile/1","relays":[{"url":"https://us1.relay.fermix.ai/","quic_port":7842},{"url":"https://eu1.relay.fermix.ai/","quic_port":7842}],"limits":{"max_connections":64,"max_streams_per_connection":4,"stream_receive_window":262144,"connection_receive_window":1048576,"send_window":1048576}}
+{"op":"start","secret_key_path":"/Users/owner/.fermix/mobile/iroh_key","bridge_socket":"/Users/owner/.fermix/mobile/bridge.sock","alpn":"fermix/mobile/1","relays":[{"url":"https://us1.relay.fermix.ai/","quic_port":7842},{"url":"https://eu1.relay.fermix.ai/","quic_port":7842}],"limits":{"max_connections":1024,"max_streams_per_connection":4,"stream_receive_window":262144,"connection_receive_window":1048576,"send_window":1048576}}
 {"op":"set_relays","relays":[{"url":"https://us1.relay.fermix.ai/","quic_port":7842},{"url":"https://eu1.relay.fermix.ai/","quic_port":7842}]}
 {"op":"close","endpoint_id":"79b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664"}
 {"op":"shutdown"}
@@ -117,7 +117,7 @@ helper                                   daemon
 |---|---|---|
 | `start` | `secret_key_path`, `bridge_socket`, `alpn`, `relays`, `limits` | Exactly once, after `hello`. The helper reads the key, binds the endpoint and answers `ready`, or `error`. |
 | `set_relays` | `relays` | Replaces the endpoint's relay map at run time: relays not named are removed, new ones added. Valid only after `ready`. |
-| `close` | `endpoint_id` (lowercase hex) | A session on a stream from this peer ended, for any reason, before it was a paired phone's session or a pairing request: in the prelude, in the Noise handshake, or before `hello` or the pair request (`../mobile/PROTOCOL.md`), the phone's own ending of the stream included. The helper bridges no further stream from the peer's connections, resetting each new one with application code `0`, and closes each connection with code `0`, reason `refused`, once every stream it bridges on it has ended and the peer has acknowledged what the daemon wrote on it, so the daemon's close frame reaches the phone first. It waits at most **5 s** for that acknowledgement after a stream ends. Valid only after `ready`; a peer with no connection is not an error. |
+| `close` | `endpoint_id` (lowercase hex) | A session on a stream from this peer ended, for any reason, before it was a paired phone's session or a pairing request: in the prelude, in the Noise handshake, or before `hello` or the pair request (`../mobile/PROTOCOL.md`), the phone's own ending of the stream included. The helper bridges no further stream from the peer's connections, resetting each new one with application code `0`, and closes each connection with code `0`, reason `refused`, once every stream it bridges on it has ended and the peer has acknowledged what the daemon wrote on it, so the daemon's close frame reaches the phone first. It gives the peer at most **5 s** after a stream ends to take and acknowledge those bytes, then resets the stream with application code `0` (**Ending.**). Valid only after `ready`; a peer with no connection is not an error. |
 | `shutdown` | — | Stop accepting; close every connection with application code `0`, reason `shutdown` (iroh's `Endpoint::close` alone sends an empty reason; a connection still in its handshake cannot carry a reason and is closed without one); close every bridge connection; wait for iroh's drain, bounded by its own timeout; exit `0` within **5 s**. The daemon kills the process group after that. This is also how the daemon turns remote reach off: after the exit nothing contacts a relay. |
 
 - **`secret_key_path`:** an absolute path to a file of exactly 32 bytes, the raw
@@ -135,14 +135,21 @@ helper                                   daemon
 - **`limits.max_connections`:** concurrent iroh connections, 1 to 1,024,
   handshaking ones included. A connection over the bound is refused before its
   handshake (iroh's `Incoming::refuse`), so it costs no key exchange, and
-  reported as `refused` `busy`. No connection holds a place for nothing: a
-  handshake not finished within **10 s** is dropped, a connection that has had
-  no stream for **30 s** is closed with code `0`, reason `idle`, the
-  connections of a peer whose session ended before `hello` or a pair request
-  are closed on the daemon's `close`, so opening stream after stream that fails
-  its handshake keeps no place, and once half the places are taken a new peer
-  whose address QUIC has not validated is sent a Retry first, so forged
-  packets never take one.
+  reported as `refused` `busy`. A connection holds its place for a bounded
+  time: a handshake not finished within **10 s** is dropped, a connection that
+  has had no stream for **30 s** is closed with code `0`, reason `idle`, and
+  the connections of a peer whose session ended before `hello` or a pair
+  request are closed on the daemon's `close`, so opening stream after stream
+  that fails its handshake keeps no place. Once half the places are taken, a
+  new peer whose address QUIC has not validated is sent a Retry first, so
+  forged packets never take one. Within those bounds an unauthenticated peer
+  holds a place for at most about 65 s: 10 s of handshake, 30 s before its
+  first stream, that stream's 10 s handshake deadline at the daemon, 10 s more
+  for a stream opened just before the daemon's `close` lands, and 5 s for the
+  peer to take and acknowledge the daemon's last bytes, whatever flow-control
+  credit it gives (see **Ending.**); 40 s if it opens no stream. Holding every
+  place so takes new connections at a sustained rate, about 16 a second for
+  1,024 places, or 26 a second without streams.
 - **`limits.max_streams_per_connection`:** concurrent bidirectional streams on one
   connection, 1 to 16, applied as the connection's QUIC bidirectional stream
   credit: a peer past it waits for a stream to close; the helper neither sees
@@ -183,17 +190,33 @@ mobile protocol's iroh carrier frames, which the daemon parses and bounds
 
 - When the peer finishes its side of the stream, the helper shuts down the write
   half of the bridge connection; the daemon reads end of file.
-- When the daemon closes the bridge connection, the helper finishes its side of
-  the stream and stops reading it.
+- When the daemon closes the bridge connection, the helper stops reading the
+  stream, sends the peer what the daemon wrote, finishes its side of the
+  stream, and counts the stream as open until the peer acknowledges its last
+  bytes. From when the helper reads the close, the peer has at most **5 s** to
+  take and acknowledge them, whatever flow-control credit it gives; a peer that
+  has not by then gets the stream reset with application code `0`. The helper
+  reads the bridge connection while it waits on the peer, into its 64 KiB
+  buffer, so it reads the close at once unless 64 KiB or more of the daemon's
+  bytes are unsent.
 - When the peer resets the stream, or the iroh connection is lost, the helper
   closes the bridge connection.
 - When the bridge socket cannot be reached, the helper resets the stream with
   application code `2` and reports `refused` `bridge_unreachable`; it does not
   retry.
 
-The daemon bounds concurrent bridge connections itself, as its mobile listener
-bounds WebSocket connections: the helper may open up to
-`max_connections × max_streams_per_connection` of them.
+The daemon bounds concurrent bridge connections itself, at 64: the helper may
+open up to `max_connections × max_streams_per_connection` of them. Past its
+bound the daemon makes room for a new connection by closing the oldest one
+whose session is still in its handshake, after a close frame, and closes the
+new one at once when every session is past its handshake. Either is the daemon
+closing a bridge connection (**Ending.**): nothing changes for the helper.
+
+`limits.max_connections` is therefore the outer bound: a connection refused
+`busy` never reaches the bridge, where room could be made for it. The daemon
+sends the most this contract allows, 1,024, far above its bridge bound, so
+silent connections fill the bridge long before they fill the helper. The helper
+does not close a silent connection to make room for a new one.
 
 Ending a stream never closes the iroh connection: a phone renews its session on a
 new stream of the same connection, opened as the last one ends. A connection with
