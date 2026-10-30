@@ -205,12 +205,17 @@ fn set_relays_before_start_is_a_bad_request() {
 fn a_start_outside_the_contract_is_a_bad_request() {
     let dir = tempfile::tempdir().unwrap();
     let key = key_file(dir.path(), 32, 0o600);
-    let mutations: [fn(&mut serde_json::Value); 5] = [
+    let mutations: [fn(&mut serde_json::Value); 8] = [
         |op| op["alpn"] = json!("fermix/mobile/2"),
         |op| op["secret_key_path"] = json!("relative/iroh_key"),
         |op| op["relays"] = json!([]),
         |op| op["limits"]["max_streams_per_connection"] = json!(17),
         |op| op["limits"]["send_window"] = json!("1048576"),
+        // The key and the bridge socket come together or not at all, and an
+        // optional field is absent, never null.
+        |op| drop(op.as_object_mut().unwrap().remove("bridge_socket")),
+        |op| drop(op.as_object_mut().unwrap().remove("secret_key_path")),
+        |op| op["secret_key_path"] = json!(null),
     ];
     for mutate in mutations {
         let mut op = start_op(&key, dir.path());
@@ -219,6 +224,20 @@ fn a_start_outside_the_contract_is_a_bad_request() {
         p.send(&op);
         p.expect_fatal(ErrorCode::BadRequest);
     }
+}
+
+#[test]
+fn a_dial_before_ready_is_a_bad_request() {
+    let mut p = Proc::spawn();
+    p.send(&json!({
+        "op": "dial",
+        "dial_id": "5f1c9a2e",
+        "endpoint_id": "79b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664",
+        "relays": [{ "url": "https://us1.relay.fermix.ai/", "quic_port": 7842 }],
+        "socket": "/tmp/dial-5f1c9a2e.sock"
+    }));
+    let message = p.expect_fatal(ErrorCode::BadRequest);
+    assert!(message.contains("before ready"), "{message}");
 }
 
 #[test]

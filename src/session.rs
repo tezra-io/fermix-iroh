@@ -2,9 +2,10 @@
 //!
 //! | Op or input | Before `ready` | After `ready` |
 //! |---|---|---|
-//! | `start` | validate, read the key, bind, answer `ready` | `bad_request` |
+//! | `start` | validate, read the key (or make one in memory to only dial), bind, answer `ready` | `bad_request` |
 //! | `set_relays` | `bad_request` | replace the relay map |
 //! | `close` | `bad_request` | close the peer's connections once their streams end |
+//! | `dial` | `bad_request` | dial the peer and copy one stream to the dial's socket |
 //! | `shutdown`, or end of stdin | exit 0 | graceful shutdown, exit 0 within 5 s |
 //! | a framing or decode error | `bad_request` | `bad_request` |
 //!
@@ -13,18 +14,19 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use iroh::Endpoint;
+use iroh::{Endpoint, SecretKey};
 use tokio::io::{AsyncRead, AsyncWrite, BufReader};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
+use crate::dial::Dialer;
 use crate::endpoint::{self, AcceptEnd, Acceptor, Network, RelayTable};
 use crate::key;
 use crate::ndjson::{EventSink, EventWriter, LineError, LineReader};
 use crate::protocol::{
-    ErrorCode, Event, LogLevel, Op, RelaySpec, StartConfig, decode_op, validate_endpoint_id,
-    validate_relays,
+    DialConfig, ErrorCode, Event, LogLevel, Op, RelaySpec, StartConfig, decode_op,
+    validate_endpoint_id, validate_relays,
 };
 use crate::shutdown;
 use crate::status;
@@ -90,7 +92,9 @@ enum Input {
 struct Running {
     endpoint: Endpoint,
     relays: RelayTable,
-    acceptor: Arc<Acceptor>,
+    /// `None` for an endpoint that only dials.
+    acceptor: Option<Arc<Acceptor>>,
+    dialer: Dialer,
     stop: CancellationToken,
     tasks: TaskTracker,
     failures: mpsc::Receiver<String>,
@@ -138,6 +142,25 @@ impl Session {
             Op::Shutdown {} => Some(self.shutdown().await),
             Op::SetRelays { relays } => self.set_relays(&relays).await,
             Op::Close { endpoint_id } => self.close_peer(&endpoint_id).await,
+            Op::Dial {
+                dial_id,
+                endpoint_id,
+                relays,
+                socket,
+                addrs,
+            } => {
+                let cfg = DialConfig::validate(
+                    &dial_id,
+                    &endpoint_id,
+                    &relays,
+                    &socket,
+                    addrs.as_deref(),
+                );
+                match cfg {
+                    Ok(cfg) => self.dial(cfg).await,
+                    Err(e) => Some(self.fail(ErrorCode::BadRequest, &e.to_string()).await),
+                }
+            }
             Op::Start {
                 secret_key_path,
                 bridge_socket,
@@ -146,8 +169,8 @@ impl Session {
                 limits,
             } => {
                 let cfg = StartConfig::validate(
-                    &secret_key_path,
-                    &bridge_socket,
+                    secret_key_path.as_deref(),
+                    bridge_socket.as_deref(),
                     &alpn,
                     &relays,
                     &limits,
@@ -164,7 +187,13 @@ impl Session {
         if self.running.is_some() {
             return Some(self.fail(ErrorCode::BadRequest, "start sent twice").await);
         }
-        let key = match key::load(&cfg.secret_key_path) {
+        // An endpoint that only dials has no key of its own: a fresh one, held
+        // in memory, so its endpoint id changes with every start.
+        let loaded = match &cfg.listen {
+            Some(listen) => key::load(&listen.secret_key_path),
+            None => Ok(SecretKey::generate()),
+        };
+        let key = match loaded {
             Ok(key) => key,
             Err(e) => return Some(self.fail(e.code(), &e.to_string()).await),
         };
@@ -187,7 +216,9 @@ impl Session {
         None
     }
 
-    /// Start the relay watcher and the accept loop on a bound endpoint.
+    /// Start the relay watcher, the accept loop (or, for an endpoint that only
+    /// dials, the loop refusing every connection) and the dialer on a bound
+    /// endpoint.
     fn launch(&self, endpoint: Endpoint, cfg: &StartConfig) -> Running {
         let stop = CancellationToken::new();
         let tasks = TaskTracker::new();
@@ -197,30 +228,58 @@ impl Session {
             self.sink.clone(),
             stop.clone(),
         ));
-        let acceptor = Arc::new(Acceptor::new(
-            endpoint.clone(),
-            cfg,
-            self.net.timings,
-            self.sink.clone(),
-            stop.clone(),
-            tasks.clone(),
-        ));
+        let acceptor = cfg.listen.as_ref().map(|listen| {
+            Arc::new(Acceptor::new(
+                endpoint.clone(),
+                cfg,
+                &listen.bridge_socket,
+                self.net.timings,
+                self.sink.clone(),
+                stop.clone(),
+                tasks.clone(),
+            ))
+        });
         let accepting = acceptor.clone();
+        let refusing = (endpoint.clone(), stop.clone());
         tasks.spawn(async move {
-            if accepting.run().await == AcceptEnd::EndpointClosed {
+            let end = match accepting {
+                Some(acceptor) => acceptor.run().await,
+                None => endpoint::refuse_all(refusing.0, refusing.1).await,
+            };
+            if end == AcceptEnd::EndpointClosed {
                 let message = "the endpoint closed while accepting".to_string();
                 // A full or closed channel means a failure is already pending
                 // or the session has ended; either way this one is redundant.
                 let _ = failure_tx.try_send(message);
             }
         });
+        let dialer = Dialer::new(
+            endpoint.clone(),
+            cfg.alpn.clone(),
+            self.net.timings.dial_deadline,
+            self.sink.clone(),
+            stop.clone(),
+            tasks.clone(),
+        );
         Running {
             endpoint,
             relays: RelayTable::new(&cfg.relays),
             acceptor,
+            dialer,
             stop,
             tasks,
             failures,
+        }
+    }
+
+    async fn dial(&mut self, cfg: DialConfig) -> Option<Exit> {
+        let started = match self.running.as_ref() {
+            Some(running) => running.dialer.dial(cfg).await,
+            None => Err("dial before ready".to_string()),
+        };
+        match started {
+            Ok(()) => None,
+            Err(message) => Some(self.fail(ErrorCode::BadRequest, &message).await),
         }
     }
 
@@ -251,13 +310,16 @@ impl Session {
         }
     }
 
-    /// Validate `endpoint_id` and have that peer's connections closed.
+    /// Validate `endpoint_id` and have that peer's connections closed. An
+    /// endpoint that only dials accepts no connection, so it has none to close.
     fn refuse_peer(&self, endpoint_id: &str) -> Result<(), String> {
         let Some(running) = self.running.as_ref() else {
             return Err("close before ready".into());
         };
         let peer = validate_endpoint_id(endpoint_id).map_err(|e| e.to_string())?;
-        running.acceptor.close_peer(peer);
+        if let Some(acceptor) = &running.acceptor {
+            acceptor.close_peer(peer);
+        }
         Ok(())
     }
 

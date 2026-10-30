@@ -9,6 +9,8 @@
 //! the place of the one that has gone longest with no stream open, and refuses
 //! it before its handshake only when every place has a stream open. The
 //! daemon's `close` reaches a peer's connections through [`Acceptor::close_peer`].
+//! An endpoint started without a key and a bridge socket only dials: it
+//! refuses every incoming connection before its handshake ([`refuse_all`]).
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::Ipv4Addr;
@@ -92,6 +94,9 @@ pub struct Timings {
     /// for as long as the peer answers. A phone renewing a session opens its
     /// next stream at once.
     pub streamless_idle: Duration,
+    /// A dial whose stream is not open and connected to its socket by then
+    /// fails `timeout`.
+    pub dial_deadline: Duration,
 }
 
 impl Timings {
@@ -100,6 +105,7 @@ impl Timings {
         Timings {
             handshake_deadline: Duration::from_secs(10),
             streamless_idle: Duration::from_secs(30),
+            dial_deadline: Duration::from_secs(20),
         }
     }
 }
@@ -470,11 +476,13 @@ pub enum AcceptEnd {
 }
 
 impl Acceptor {
-    /// An acceptor for `endpoint` under `cfg`'s limits. Connection and stream
-    /// tasks are spawned on `tasks` and end when `stop` fires.
+    /// An acceptor for `endpoint` under `cfg`'s limits, bridging to
+    /// `bridge_socket`. Connection and stream tasks are spawned on `tasks` and
+    /// end when `stop` fires.
     pub fn new(
         endpoint: Endpoint,
         cfg: &StartConfig,
+        bridge_socket: &Path,
         timings: Timings,
         sink: EventSink,
         stop: CancellationToken,
@@ -485,7 +493,7 @@ impl Acceptor {
             slots: Slots::new(cfg.limits.max_connections),
             peers: Peers::default(),
             timings,
-            socket: Arc::from(cfg.bridge_socket.as_path()),
+            socket: Arc::from(bridge_socket),
             sink,
             stop,
             tasks,
@@ -734,6 +742,22 @@ impl Acceptor {
             bridge::run(send, recv, ctx).await;
             drop(open);
         });
+    }
+}
+
+/// The accept loop of an endpoint that only dials: every incoming connection is
+/// refused before its handshake, so it costs no key exchange and holds no
+/// place. Nothing is reported; the daemon has no listener to account for.
+pub async fn refuse_all(endpoint: Endpoint, stop: CancellationToken) -> AcceptEnd {
+    loop {
+        let incoming = tokio::select! {
+            _ = stop.cancelled() => return AcceptEnd::Stopped,
+            incoming = endpoint.accept() => incoming,
+        };
+        match incoming {
+            Some(incoming) => incoming.refuse(),
+            None => return AcceptEnd::EndpointClosed,
+        }
     }
 }
 

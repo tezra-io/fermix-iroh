@@ -2,13 +2,17 @@
 //!
 //! `fermix-iroh` binds one iroh endpoint with the daemon's key and relays,
 //! accepts connections on one ALPN, and copies each accepted bidirectional
-//! stream to one connection on the daemon's Unix bridge socket. It holds no
-//! trust of its own and decides nothing: the daemon authenticates every peer
-//! through the mobile protocol's Noise session.
+//! stream to one connection on the daemon's Unix bridge socket. Started with
+//! no key and no bridge socket it only dials, with a key held in memory. Either
+//! way it dials the peers the daemon names and copies each dialed stream to a
+//! socket the daemon names. It holds no trust of its own and decides nothing:
+//! the daemon authenticates every peer through the mobile protocol's Noise
+//! session.
 //!
 //! The wire contract is `protocol/PROTOCOL.md`, vendored from the daemon.
 
 pub mod bridge;
+pub mod dial;
 pub mod endpoint;
 pub mod key;
 pub mod ndjson;

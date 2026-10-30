@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use fermix_iroh::IROH_VERSION;
 use fermix_iroh::bridge::preamble;
-use fermix_iroh::protocol::{Event, KIND_PHONE, Op, PROTOCOL_VERSION, decode_op};
+use fermix_iroh::protocol::{DialConfig, Event, KIND_PHONE, Op, PROTOCOL_VERSION, decode_op};
 use iroh::SecretKey;
 
 const EVENT_FIXTURES: &[&str] = &[
@@ -24,12 +24,18 @@ const EVENT_FIXTURES: &[&str] = &[
     "refused.json",
     "log.json",
     "error.json",
+    "dialed.json",
+    "dial_failed.json",
+    "dial_closed.json",
 ];
 
 const OP_FIXTURES: &[&str] = &[
     "start.json",
+    "start_dial_only.json",
     "set_relays.json",
     "close.json",
+    "dial.json",
+    "dial_direct.json",
     "shutdown.json",
 ];
 
@@ -87,9 +93,8 @@ fn every_op_fixture_decodes_through_the_production_path_and_round_trips() {
     }
 }
 
-#[test]
-fn the_start_fixture_validates() {
-    let line = one_line("start.json", &fixture("start.json"));
+fn validated_start(name: &str) -> fermix_iroh::protocol::StartConfig {
+    let line = one_line(name, &fixture(name));
     let Op::Start {
         secret_key_path,
         bridge_socket,
@@ -98,18 +103,62 @@ fn the_start_fixture_validates() {
         limits,
     } = decode_op(&line).unwrap()
     else {
-        panic!("start.json is not a start");
+        panic!("{name} is not a start");
     };
-    let cfg = fermix_iroh::protocol::StartConfig::validate(
-        &secret_key_path,
-        &bridge_socket,
+    fermix_iroh::protocol::StartConfig::validate(
+        secret_key_path.as_deref(),
+        bridge_socket.as_deref(),
         &alpn,
         &relays,
         &limits,
     )
-    .expect("the contract's own start is valid");
+    .unwrap_or_else(|e| panic!("the contract's own {name} is invalid: {e}"))
+}
+
+#[test]
+fn the_start_fixtures_validate() {
+    let cfg = validated_start("start.json");
     assert_eq!(cfg.kind, KIND_PHONE);
     assert_eq!(cfg.relays.len(), 2);
+    assert!(cfg.listen.is_some());
+    let dial_only = validated_start("start_dial_only.json");
+    assert_eq!(dial_only.listen, None);
+    assert_eq!(dial_only.relays, cfg.relays);
+    assert_eq!(dial_only.limits, cfg.limits);
+}
+
+fn validated_dial(name: &str) -> DialConfig {
+    let line = one_line(name, &fixture(name));
+    let Op::Dial {
+        dial_id,
+        endpoint_id,
+        relays,
+        socket,
+        addrs,
+    } = decode_op(&line).unwrap()
+    else {
+        panic!("{name} is not a dial");
+    };
+    DialConfig::validate(&dial_id, &endpoint_id, &relays, &socket, addrs.as_deref())
+        .unwrap_or_else(|e| panic!("the contract's own {name} is invalid: {e}"))
+}
+
+#[test]
+fn the_dial_fixtures_validate() {
+    let dial = validated_dial("dial.json");
+    assert_eq!(dial.peer.to_string(), FIXTURE_ENDPOINT_ID);
+    assert_eq!(dial.relays.len(), 2);
+    assert!(dial.addrs.is_empty());
+    let direct = validated_dial("dial_direct.json");
+    assert_eq!(direct.dial_id, dial.dial_id);
+    assert_eq!(
+        direct
+            .addrs
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        ["127.0.0.1:4100", "[::1]:4100"]
+    );
 }
 
 #[test]

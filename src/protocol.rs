@@ -6,17 +6,19 @@
 //! round-trips every fixture through these types and compares bytes.
 //!
 //! Decoding is strict. A line that is not a JSON object, an unknown `op`, a
-//! missing field, an unknown field or a field of the wrong type is a decode
-//! error; a well-typed `start`, `set_relays` or `close` whose values are out of
-//! range is a validation error. Both end the helper with `bad_request`.
+//! missing field, an unknown field, a field of the wrong type or an optional
+//! field sent as `null` is a decode error; a well-typed `start`, `set_relays`,
+//! `close` or `dial` whose values are out of range is a validation error. Both
+//! end the helper with `bad_request`.
 
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use iroh::{EndpointId, RelayUrl};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// The single integer version carried in `hello`. Pinned to `protocol/PROTOCOL.md`.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// The longest control line, in bytes, not counting its terminating `\n`.
 pub const MAX_LINE_BYTES: usize = 64 * 1024;
@@ -41,6 +43,12 @@ pub const MAX_CONNECTIONS_RANGE: (u32, u32) = (1, 1024);
 pub const MAX_STREAMS_RANGE: (u32, u32) = (1, 16);
 /// Bounds of each flow-control window, in bytes.
 pub const WINDOW_RANGE: (u64, u64) = (65_536, 16_777_216);
+
+/// The longest `dial_id`, in bytes.
+pub const DIAL_ID_MAX_BYTES: usize = 64;
+
+/// The most direct addresses a `dial` may name.
+pub const DIAL_ADDRS_MAX: usize = 8;
 
 /// The bridge preamble's peer kind for an accepted ALPN, or `None` for an ALPN
 /// this helper has no kind for.
@@ -95,6 +103,24 @@ pub enum PathKind {
     Relay,
     /// A direct UDP path.
     Direct,
+}
+
+/// Why a `dial` did not give the daemon a stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DialFailure {
+    /// No path to the peer: no address worked, or the endpoint could not start
+    /// the connection.
+    Unreachable,
+    /// The connection, the stream or the socket was not ready within the
+    /// dial's deadline.
+    Timeout,
+    /// The peer ended the connection or failed its handshake.
+    Refused,
+    /// The daemon's dial socket could not be reached.
+    BridgeUnreachable,
+    /// The helper already has its most dials in flight.
+    Busy,
 }
 
 /// Frames the helper sends. Serialized as one compact JSON object per line;
@@ -162,6 +188,27 @@ pub enum Event {
         /// At most [`MAX_TEXT_BYTES`].
         message: String,
     },
+    /// A dial's stream is open and connected to its socket.
+    Dialed {
+        /// The daemon's id for the dial.
+        dial_id: String,
+        /// The connection's selected path when the stream opened.
+        kind: PathKind,
+        /// The relay URL, or `None` for a direct path.
+        relay: Option<String>,
+    },
+    /// A dial ended without a stream.
+    DialFailed {
+        /// The daemon's id for the dial.
+        dial_id: String,
+        /// Why.
+        reason: DialFailure,
+    },
+    /// A dialed stream ended, however it ended.
+    DialClosed {
+        /// The daemon's id for the dial.
+        dial_id: String,
+    },
 }
 
 impl Event {
@@ -228,12 +275,24 @@ pub struct Limits {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Op {
-    /// Read the key, bind the endpoint, answer `ready`.
+    /// Read the key (or make one in memory), bind the endpoint, answer `ready`.
     Start {
-        /// Absolute path to the 32-byte, mode-0600 key file.
-        secret_key_path: String,
-        /// Absolute path to the daemon's bridge socket.
-        bridge_socket: String,
+        /// Absolute path to the 32-byte, mode-0600 key file; absent, with
+        /// `bridge_socket`, for an endpoint that only dials.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "present"
+        )]
+        secret_key_path: Option<String>,
+        /// Absolute path to the daemon's bridge socket; absent, with
+        /// `secret_key_path`, for an endpoint that only dials.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "present"
+        )]
+        bridge_socket: Option<String>,
         /// The one application protocol to accept.
         alpn: String,
         /// The relays the endpoint uses, and only these.
@@ -251,6 +310,24 @@ pub enum Op {
     Close {
         /// The peer's endpoint id, lowercase hex.
         endpoint_id: String,
+    },
+    /// Dial a peer, open one stream, connect it to `socket` and copy both ways.
+    Dial {
+        /// The daemon's id for this dial, named in its events.
+        dial_id: String,
+        /// The peer's endpoint id, lowercase hex.
+        endpoint_id: String,
+        /// The peer's relays.
+        relays: Vec<RelaySpec>,
+        /// Absolute path to the Unix socket the daemon listens on for this dial.
+        socket: String,
+        /// Direct UDP addresses (`ip:port`) to try besides the relays.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "present"
+        )]
+        addrs: Option<Vec<String>>,
     },
     /// Close everything and exit 0. A struct variant, so an unknown field on it
     /// is refused like on every other op.
@@ -287,6 +364,17 @@ pub fn decode_op(line: &str) -> Result<Op, RequestError> {
     serde_json::from_str(line).map_err(|e| RequestError::Malformed(e.to_string()))
 }
 
+/// An optional field that is present: `null` is refused, as the contract's
+/// optional fields are absent, never `null`. With `#[serde(default)]`, an absent
+/// field is `None`.
+fn present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
 /// Validate a peer's endpoint id: 64 lowercase hex digits, as iroh displays it
 /// and the daemon reads it from a preamble, naming an Ed25519 public key.
 pub fn validate_endpoint_id(raw: &str) -> Result<EndpointId, RequestError> {
@@ -310,13 +398,21 @@ pub struct Relay {
     pub quic_port: u16,
 }
 
-/// A validated `start`.
+/// What a listening endpoint needs: its key and where to bridge its streams.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StartConfig {
+pub struct Listen {
     /// Absolute key file path.
     pub secret_key_path: PathBuf,
     /// Absolute bridge socket path.
     pub bridge_socket: PathBuf,
+}
+
+/// A validated `start`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartConfig {
+    /// The key and the bridge socket, or `None` for an endpoint that only
+    /// dials, with a key held in memory.
+    pub listen: Option<Listen>,
     /// The accepted ALPN, as bytes.
     pub alpn: Vec<u8>,
     /// The peer kind written in every bridge preamble.
@@ -343,10 +439,11 @@ pub struct ValidLimits {
 }
 
 impl StartConfig {
-    /// Validate the fields of a `start` op.
+    /// Validate the fields of a `start` op. `secret_key_path` and
+    /// `bridge_socket` come together or not at all.
     pub fn validate(
-        secret_key_path: &str,
-        bridge_socket: &str,
+        secret_key_path: Option<&str>,
+        bridge_socket: Option<&str>,
         alpn: &str,
         relays: &[RelaySpec],
         limits: &Limits,
@@ -355,14 +452,101 @@ impl StartConfig {
             RequestError::invalid("alpn", format!("only {ALPN_MOBILE} is accepted"))
         })?;
         Ok(StartConfig {
-            secret_key_path: absolute_path("secret_key_path", secret_key_path)?,
-            bridge_socket: socket_path(bridge_socket)?,
+            listen: validate_listen(secret_key_path, bridge_socket)?,
             alpn: alpn.as_bytes().to_vec(),
             kind,
             relays: validate_relays(relays)?,
             limits: validate_limits(limits)?,
         })
     }
+}
+
+fn validate_listen(
+    secret_key_path: Option<&str>,
+    bridge_socket: Option<&str>,
+) -> Result<Option<Listen>, RequestError> {
+    match (secret_key_path, bridge_socket) {
+        (Some(key), Some(socket)) => Ok(Some(Listen {
+            secret_key_path: absolute_path("secret_key_path", key)?,
+            bridge_socket: socket_path("bridge_socket", socket)?,
+        })),
+        (None, None) => Ok(None),
+        (Some(_), None) => Err(RequestError::invalid(
+            "bridge_socket",
+            "secret_key_path and bridge_socket come together",
+        )),
+        (None, Some(_)) => Err(RequestError::invalid(
+            "secret_key_path",
+            "secret_key_path and bridge_socket come together",
+        )),
+    }
+}
+
+/// A validated `dial`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DialConfig {
+    /// The daemon's id for the dial.
+    pub dial_id: String,
+    /// The peer to dial.
+    pub peer: EndpointId,
+    /// The peer's relays.
+    pub relays: Vec<Relay>,
+    /// The daemon's socket for this dial.
+    pub socket: PathBuf,
+    /// Direct UDP addresses to try besides the relays.
+    pub addrs: Vec<SocketAddr>,
+}
+
+impl DialConfig {
+    /// Validate the fields of a `dial` op.
+    pub fn validate(
+        dial_id: &str,
+        endpoint_id: &str,
+        relays: &[RelaySpec],
+        socket: &str,
+        addrs: Option<&[String]>,
+    ) -> Result<Self, RequestError> {
+        Ok(DialConfig {
+            dial_id: validate_dial_id(dial_id)?,
+            peer: validate_endpoint_id(endpoint_id)?,
+            relays: validate_relays(relays)?,
+            socket: socket_path("socket", socket)?,
+            addrs: validate_addrs(addrs.unwrap_or_default())?,
+        })
+    }
+}
+
+/// A dial id: 1 to 64 of `a`–`z`, `0`–`9`, `-` and `_`.
+pub fn validate_dial_id(raw: &str) -> Result<String, RequestError> {
+    let shaped = (1..=DIAL_ID_MAX_BYTES).contains(&raw.len())
+        && raw
+            .bytes()
+            .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_'));
+    if !shaped {
+        return Err(RequestError::invalid(
+            "dial_id",
+            format!("not 1 to {DIAL_ID_MAX_BYTES} of a-z, 0-9, - and _"),
+        ));
+    }
+    Ok(raw.to_string())
+}
+
+fn validate_addrs(addrs: &[String]) -> Result<Vec<SocketAddr>, RequestError> {
+    if addrs.len() > DIAL_ADDRS_MAX {
+        return Err(RequestError::invalid(
+            "addrs",
+            format!("{} entries, at most {DIAL_ADDRS_MAX}", addrs.len()),
+        ));
+    }
+    addrs
+        .iter()
+        .map(|raw| {
+            raw.parse::<SocketAddr>()
+                .ok()
+                .filter(|addr| addr.port() != 0)
+                .ok_or_else(|| RequestError::invalid("addrs", format!("{raw} is not ip:port")))
+        })
+        .collect()
 }
 
 /// Validate a relay list: one to eight distinct `https` URLs with non-zero ports.
@@ -463,12 +647,12 @@ fn absolute_path(field: &'static str, raw: &str) -> Result<PathBuf, RequestError
     Ok(path.to_path_buf())
 }
 
-fn socket_path(raw: &str) -> Result<PathBuf, RequestError> {
-    let path = absolute_path("bridge_socket", raw)?;
+fn socket_path(field: &'static str, raw: &str) -> Result<PathBuf, RequestError> {
+    let path = absolute_path(field, raw)?;
     // A path the OS cannot hold in a sockaddr_un would fail every stream as
     // bridge_unreachable; refuse it once, here, instead.
     std::os::unix::net::SocketAddr::from_pathname(&path)
-        .map_err(|e| RequestError::invalid("bridge_socket", e.to_string()))?;
+        .map_err(|e| RequestError::invalid(field, e.to_string()))?;
     Ok(path)
 }
 
@@ -506,13 +690,37 @@ mod tests {
     }
 
     fn start(relays: &[RelaySpec], limits: &Limits) -> Result<StartConfig, RequestError> {
-        StartConfig::validate("/k/iroh_key", "/k/bridge.sock", ALPN_MOBILE, relays, limits)
+        StartConfig::validate(
+            Some("/k/iroh_key"),
+            Some("/k/bridge.sock"),
+            ALPN_MOBILE,
+            relays,
+            limits,
+        )
+    }
+
+    fn validate(key: &str, socket: &str, alpn: &str) -> Result<StartConfig, RequestError> {
+        let relays = [relay("https://r.example/")];
+        StartConfig::validate(Some(key), Some(socket), alpn, &relays, &limits())
+    }
+
+    const PEER: &str = "79b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664";
+
+    fn dial(id: &str, socket: &str, addrs: Option<&[String]>) -> Result<DialConfig, RequestError> {
+        DialConfig::validate(id, PEER, &[relay("https://r.example/")], socket, addrs)
     }
 
     #[test]
     fn a_contract_start_validates() {
         let cfg = start(&[relay("https://us1.relay.fermix.ai/")], &limits()).unwrap();
         assert_eq!(cfg.kind, KIND_PHONE);
+        assert_eq!(
+            cfg.listen,
+            Some(Listen {
+                secret_key_path: PathBuf::from("/k/iroh_key"),
+                bridge_socket: PathBuf::from("/k/bridge.sock"),
+            })
+        );
         assert_eq!(cfg.alpn, b"fermix/mobile/1");
         assert_eq!(
             cfg.relays[0].url.to_string(),
@@ -565,20 +773,92 @@ mod tests {
 
     #[test]
     fn paths_must_be_absolute_and_the_socket_must_fit_a_sockaddr() {
-        let relays = [relay("https://r.example/")];
-        let rel = StartConfig::validate("k", "/s", ALPN_MOBILE, &relays, &limits());
-        assert!(rel.is_err());
-        let rel = StartConfig::validate("/k", "s", ALPN_MOBILE, &relays, &limits());
-        assert!(rel.is_err());
+        assert!(validate("k", "/s", ALPN_MOBILE).is_err());
+        assert!(validate("/k", "s", ALPN_MOBILE).is_err());
         let long = format!("/{}", "s".repeat(200));
-        let long = StartConfig::validate("/k", &long, ALPN_MOBILE, &relays, &limits());
-        assert!(long.is_err());
+        assert!(validate("/k", &long, ALPN_MOBILE).is_err());
+    }
+
+    #[test]
+    fn a_start_without_key_and_socket_only_dials_and_one_without_the_other_is_refused() {
+        let relays = [relay("https://r.example/")];
+        let dial_only = StartConfig::validate(None, None, ALPN_MOBILE, &relays, &limits());
+        assert_eq!(dial_only.unwrap().listen, None);
+        for (key, socket, field) in [
+            (Some("/k"), None, "bridge_socket"),
+            (None, Some("/s"), "secret_key_path"),
+        ] {
+            let half = StartConfig::validate(key, socket, ALPN_MOBILE, &relays, &limits());
+            assert!(
+                matches!(&half, Err(RequestError::Invalid { field: f, .. }) if *f == field),
+                "{half:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn optional_fields_are_absent_never_null() {
+        let dial_only = r#"{"op":"start","alpn":"fermix/mobile/1","relays":[{"url":"https://r/","quic_port":1}],"limits":{"max_connections":1,"max_streams_per_connection":1,"stream_receive_window":65536,"connection_receive_window":65536,"send_window":65536}}"#;
+        assert!(matches!(
+            decode_op(dial_only),
+            Ok(Op::Start {
+                secret_key_path: None,
+                bridge_socket: None,
+                ..
+            })
+        ));
+        let null_key = dial_only.replace(
+            r#""alpn""#,
+            r#""secret_key_path":null,"bridge_socket":"/s","alpn""#,
+        );
+        assert!(matches!(
+            decode_op(&null_key),
+            Err(RequestError::Malformed(_))
+        ));
+        let null_addrs = format!(
+            r#"{{"op":"dial","dial_id":"a","endpoint_id":"{PEER}","relays":[],"socket":"/s","addrs":null}}"#
+        );
+        assert!(matches!(
+            decode_op(&null_addrs),
+            Err(RequestError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn a_contract_dial_validates() {
+        let addrs = ["127.0.0.1:4100".to_string(), "[::1]:4100".to_string()];
+        let cfg = dial("5f1c9a2e", "/k/dial-5f1c9a2e.sock", Some(&addrs)).unwrap();
+        assert_eq!(cfg.dial_id, "5f1c9a2e");
+        assert_eq!(cfg.peer.to_string(), PEER);
+        assert_eq!(cfg.socket, PathBuf::from("/k/dial-5f1c9a2e.sock"));
+        assert_eq!(cfg.addrs.len(), 2);
+        assert!(dial("a", "/s", None).unwrap().addrs.is_empty());
+    }
+
+    #[test]
+    fn a_dial_outside_the_contract_is_refused() {
+        let long = "d".repeat(DIAL_ID_MAX_BYTES + 1);
+        for id in ["", "Upper", "with space", "dot.ted", long.as_str()] {
+            assert!(dial(id, "/s", None).is_err(), "{id:?}");
+        }
+        assert!(dial(&"d".repeat(DIAL_ID_MAX_BYTES), "/s", None).is_ok());
+        assert!(dial("a", "relative.sock", None).is_err());
+        assert!(dial("a", &format!("/{}", "s".repeat(200)), None).is_err());
+        for bad in ["localhost:1", "127.0.0.1", "127.0.0.1:0", "nope"] {
+            assert!(dial("a", "/s", Some(&[bad.to_string()])).is_err(), "{bad}");
+        }
+        let nine: Vec<String> = (1..=9).map(|p| format!("127.0.0.1:{p}")).collect();
+        assert!(dial("a", "/s", Some(&nine)).is_err());
+        assert!(dial("a", "/s", Some(&nine[..8])).is_ok());
+        let none = DialConfig::validate("a", PEER, &[], "/s", None);
+        assert!(none.is_err(), "a dial names one to eight relays");
+        let bad_peer = DialConfig::validate("a", "79B5", &[relay("https://r/")], "/s", None);
+        assert!(bad_peer.is_err());
     }
 
     #[test]
     fn only_the_mobile_alpn_is_accepted() {
-        let relays = [relay("https://r.example/")];
-        let other = StartConfig::validate("/k", "/s", "other/1", &relays, &limits());
+        let other = validate("/k", "/s", "other/1");
         assert!(other.is_err());
         assert_eq!(kind_for_alpn(b"fermix/mobile/1"), Some(0x01));
         assert_eq!(kind_for_alpn(b"fermix/mobile/2"), None);
@@ -598,6 +878,8 @@ mod tests {
             "{\"op\":\"set_relays\"}",
             "{\"op\":\"close\"}",
             "{\"op\":\"close\",\"endpoint_id\":7}",
+            "{\"op\":\"dial\",\"dial_id\":\"a\"}",
+            "{\"op\":\"dial\",\"dial_id\":\"a\",\"endpoint_id\":\"x\",\"relays\":[],\"socket\":\"/s\",\"via\":\"x\"}",
             "{\"event\":\"hello\"}",
         ] {
             assert!(

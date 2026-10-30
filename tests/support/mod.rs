@@ -12,7 +12,7 @@
 #![allow(dead_code)]
 
 use std::future::Future;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -220,6 +220,55 @@ impl Helper {
         self.wait_relay_connected(home).await;
     }
 
+    /// `start` naming these relay entries, with this helper's key and bridge
+    /// socket (`listen`) or without either (an endpoint that only dials).
+    pub fn start_op_for(&self, relays: &[serde_json::Value], listen: bool) -> serde_json::Value {
+        let mut op = json!({
+            "op": "start",
+            "alpn": "fermix/mobile/1",
+            "relays": relays,
+            "limits": {
+                "max_connections": 8,
+                "max_streams_per_connection": 4,
+                "stream_receive_window": 262144,
+                "connection_receive_window": 1048576,
+                "send_window": 1048576,
+            }
+        });
+        if listen {
+            op["secret_key_path"] = json!(self.key_path);
+            op["bridge_socket"] = json!(self.socket_path);
+        }
+        op
+    }
+
+    /// Send `start_op_for` and read `ready` and the bound-sockets log; returns
+    /// the endpoint id `ready` names and the endpoint's UDP address. A listening
+    /// endpoint's id must be its key's.
+    pub async fn start_on(
+        &mut self,
+        relays: &[serde_json::Value],
+        listen: bool,
+    ) -> (EndpointId, SocketAddr) {
+        self.send(&self.start_op_for(relays, listen)).await;
+        let Event::Ready { endpoint_id } = self.next_event().await else {
+            panic!("start is answered with ready");
+        };
+        let id: EndpointId = endpoint_id.parse().expect("ready names an endpoint id");
+        if listen {
+            assert_eq!(id, self.endpoint_id());
+        }
+        let Event::Log { message, .. } = self.next_event().await else {
+            panic!("ready is followed by the bound-sockets log");
+        };
+        let addr = message
+            .strip_prefix("bound UDP sockets: ")
+            .and_then(|list| list.split(", ").next())
+            .and_then(|first| first.parse().ok())
+            .unwrap_or_else(|| panic!("no UDP address in {message:?}"));
+        (id, addr)
+    }
+
     /// Wait for a `relay` event naming `home` as connected.
     pub async fn wait_relay_connected(&mut self, home: &TestRelay) {
         let url = home.url.to_string();
@@ -343,6 +392,33 @@ pub async fn dial(
     within("the dial", phone.connect(addr, alpn))
         .await
         .map_err(|e| e.to_string())
+}
+
+/// A relay entry nothing serves: a loopback port that refuses connections, so
+/// the endpoint resolves no name and reaches nothing through it.
+pub fn dead_relay() -> serde_json::Value {
+    json!({ "url": "https://127.0.0.1:1/", "quic_port": 1 })
+}
+
+/// The contract's `dial`.
+pub fn dial_op(
+    dial_id: &str,
+    peer: EndpointId,
+    relays: &[serde_json::Value],
+    socket: &Path,
+    addrs: &[SocketAddr],
+) -> serde_json::Value {
+    let mut op = json!({
+        "op": "dial",
+        "dial_id": dial_id,
+        "endpoint_id": peer.to_string(),
+        "relays": relays,
+        "socket": socket,
+    });
+    if !addrs.is_empty() {
+        op["addrs"] = json!(addrs.iter().map(ToString::to_string).collect::<Vec<_>>());
+    }
+    op
 }
 
 /// Accept one bridge connection and read its 37-byte preamble.
