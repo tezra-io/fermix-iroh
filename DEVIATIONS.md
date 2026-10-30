@@ -238,3 +238,44 @@ so a panicking task is never swallowed by the async runtime. A failure to read
 stdin is `error` `internal`. If stdout itself fails, the helper exits 1 without
 an `error` (there is nowhere to send one). All of these are crashes to the
 daemon, as the contract says.
+
+### B13. Which dial failure an unreachable peer gets
+
+Adopted in the contract with protocol 3 (the `dial_failed` row); kept here as
+the evidence for that wording.
+
+- **Contract:** `unreachable` (no path to the peer) and `timeout` (not open and
+  connected within 20 s).
+- **iroh 1.3.0:** a connection to a peer whose address names a relay keeps its
+  handshake pending while iroh tries that relay and any direct address. Dialing
+  a key nobody holds through a relay nothing serves and a closed UDP port,
+  iroh reported no failure within the dial's 20 s (the comment in
+  `connect_with_opts`, `iroh/src/endpoint.rs`, promises a 10 s timeout only
+  "if no reachable address is available"). So a peer that is offline, or a
+  relay that cannot be reached, is answered `timeout`.
+- **What the helper does:** `unreachable` is iroh refusing to start the
+  connection (no address, the endpoint's own id, a closed endpoint, a QUIC
+  connect error) or a handshake iroh gave up on (`TimedOut`); `refused` is the
+  peer ending the connection (any close it sent, a reset, a failed TLS
+  handshake: a full helper's `busy`, a peer that only dials, a foreign key);
+  `timeout` is the deadline. `tests/dial.rs` pins each:
+  `a_peer_nobody_answers_for_fails_timeout`,
+  `a_dial_iroh_cannot_start_is_unreachable`,
+  `a_helper_that_only_dials_refuses_every_connection`.
+- **Proposed wording:** "`unreachable` (iroh could not start the connection:
+  no address, or the handshake failed on its own); a peer that never answers
+  is `timeout`."
+
+### B14. Closing a dial's connection when the dial fails
+
+Adopted in the contract with protocol 3 (*Dialing*, **Copying.**).
+
+The contract names the close of a finished dial (`done`) and of shutdown
+(`shutdown`). A dial that fails after its connection is made (its stream
+never opened in time, its socket unreachable) closes the connection with code
+0 and the failure's name as the reason (`timeout`, `bridge_unreachable`,
+`refused`). The peer's daemon sees a connection close and nothing else; the
+reason is diagnostic only.
+
+*Proposed wording:* "A dial that fails once its connection is made closes it
+with code `0`, reason the failure's name."

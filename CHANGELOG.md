@@ -9,6 +9,39 @@ The wire `protocol_version` is versioned separately from this crate; see
 
 ## [Unreleased]
 
+Implements `protocol_version` 3, which lets the daemon reach another Fermix
+engine over the rail (M75). An engine that speaks version 2 refuses this
+helper, and an engine that speaks version 3 refuses every earlier one, so the
+engine pins it in the same change that moves the engine to version 3.
+
+### Added
+
+- `start` without `secret_key_path` and `bridge_socket` (both absent, or both
+  present as before; one alone is `bad_request`, and `null` is never absent):
+  the endpoint binds with a fresh key held in memory, refuses every incoming
+  connection before its handshake and reports none of them, and only dials.
+- `dial {dial_id, endpoint_id, relays, socket, addrs?}`: dial the peer with
+  `fermix/mobile/1` through its relays (and the direct addresses `addrs`
+  names, which only a test that knows where the peer listens sends), open one
+  bidirectional stream, connect it to the daemon's `socket` with no preamble,
+  and copy it exactly as an accepted stream is copied, every *Ending* rule
+  included. Valid after `ready` in either mode; a `dial_id` still in flight is
+  `bad_request`.
+- Events `dialed {dial_id, kind, relay}` (the connection's selected path when
+  the stream opened), `dial_failed {dial_id, reason}` (`unreachable`,
+  `timeout` at 20 s, `refused`, `bridge_unreachable` with the stream reset
+  code 2, `busy` past 8 dials in flight) and `dial_closed {dial_id}`. A dial
+  is forgotten before its last event is sent, so its id may be reused at once.
+  One dial is one connection, closed with code 0, reason `done`, once both
+  directions of its stream have ended.
+- `tests/dial.rs`: dials between local helpers, through the in-process relay
+  and directly at a UDP address with no relay serving, and every failure.
+
+### Changed
+
+- `protocol/` is re-vendored from the engine's protocol 3 export at fermix
+  492a822e, which `PROTOCOL_SOURCE` now names.
+
 ## [0.2.2] - 2026-10-25
 
 A full helper makes room for a new connection instead of refusing it. Still

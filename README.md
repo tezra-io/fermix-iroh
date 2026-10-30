@@ -6,10 +6,14 @@ as a child process, speaks NDJSON with it over stdin/stdout, and the helper
 binds one [iroh](https://github.com/n0-computer/iroh) endpoint with the daemon's
 key and relays, accepts connections on one application protocol, and copies
 each accepted stream to one connection on a Unix socket the daemon listens on.
+It also lets the daemon reach another Fermix engine the same way: on the
+daemon's `dial` it dials that engine's endpoint, opens one stream and copies it
+to a Unix socket the daemon names for the dial. Started without a key and a
+bridge socket, the endpoint only dials, with a key held in memory.
 
 | | |
 |---|---|
-| Wire | NDJSON on stdio, `protocol_version` 2 |
+| Wire | NDJSON on stdio, `protocol_version` 3 |
 | iroh | `=1.3.0`, the `Minimal` preset, the daemon's relays only, no address lookup |
 | Application protocol | `fermix/mobile/1`, a phone; anything else is refused in the TLS handshake |
 | Bridge | one Unix-socket connection per stream: a 37-byte `FXB1` preamble, then the stream's bytes, unparsed |
@@ -21,15 +25,18 @@ each accepted stream to one connection on a Unix socket the daemon listens on.
   iroh endpoint id the helper passes in the preamble is accounting metadata.
   When a session ends before `hello` or a pair request, the daemon's `close`
   has the helper close that peer's connections once their streams end.
-- **Not a router.** A peer names no socket, host, URL or method. Every stream
-  goes to the one bridge socket the daemon named in `start`, and nowhere else.
+- **Not a router.** A peer names no socket, host, URL or method. Every accepted
+  stream goes to the one bridge socket the daemon named in `start`, every
+  dialed stream to the socket the daemon named in its `dial`, and nowhere else.
 - **Not a parser.** It never reads the bytes it copies; they are the daemon's
   length-prefixed Noise frames, bounded by the daemon.
-- **Not a network client of anyone but the daemon's relays.** It binds UDP
-  sockets for QUIC, asks the local router for a port mapping, probes only the
-  relays the daemon names, and resolves their names through the system's
-  configured nameservers only. It opens no listener, publishes nothing to an
-  address lookup service, never uses n0's relays, and ignores proxy variables.
+- **Not a network client of anyone but the daemon's relays and peers.** It
+  binds UDP sockets for QUIC, asks the local router for a port mapping, probes
+  only the relays the daemon names, dials only the peers the daemon names
+  (through the relays and addresses the `dial` names), and resolves relay
+  names through the system's configured nameservers only. It opens no
+  listener, publishes nothing to an address lookup service, never uses n0's
+  relays, and ignores proxy variables.
 - **Not a writer of anything.** It reads one file, the key, and writes none.
 
 ## The protocol is not ours
@@ -74,19 +81,22 @@ stop before the endpoint binds.
 
 | Suite | What it pins |
 |---|---|
-| unit tests (`src/`) | validation ranges, key file checks, framing, text sanitizing, the connection bound |
+| unit tests (`src/`) | validation ranges (`start`'s key and socket together or not at all, every `dial` field), key file checks, framing, text sanitizing, the connection bound |
 | `tests/fixtures.rs` | the vendored contract, byte for byte |
 | `tests/framing_props.rs` | property tests: arbitrary bytes never panic the reader or the decoder, no line exceeds 64 KiB, an over-long line is refused |
-| `tests/process.rs` | the binary over real pipes: `hello` first, exit codes, every failure before bind |
+| `tests/process.rs` | the binary over real pipes: `hello` first, exit codes, every failure before bind, a `dial` before `ready` |
 | `tests/relay_tls.rs` | the production relay verifier refuses a chain through a compromised eMudhra intermediate |
 | `tests/session.rs` | end to end over a local relay: preamble, copying both ways, every *Ending* rule, renewal on a second stream, stream credit, ALPN and busy refusals, a full helper making room for a new connection, unreachable bridge, `set_relays`, `close` (the daemon's last bytes first, later streams reset, that peer only, a lost connection still noticed, a peer that gives its stream no credit still closed), a stream given no credit reset 5 s after the daemon closes it, `closed`, shutdown within 5 s, end of stdin |
+| `tests/dial.rs` | dials between local helpers: through the local relay, and directly at a UDP address with no relay serving (`dialed` with its path, no preamble, copying both ways, either side ending first, `dial_closed`); a helper that only dials refusing every connection; `dial_failed` `refused`, `bridge_unreachable` (and the id free again at once), `timeout` (a stream that never opens, a peer nobody answers for), `unreachable` (a dial iroh cannot start), `busy` past 8 dials; a `dial_id` in flight is a bad request; shutdown ends dials in flight without an event |
 
 ### The engine's end-to-end test
 
 `examples/test_peer.rs` is a stand-in phone for the engine's opt-in end-to-end
 test (`Mobile.Iroh.EndToEndTest`): it dials a running helper directly at one
 UDP address, with no relay, offering `fermix/mobile/1`, and pipes one stream to
-its stdin and stdout. An example, so the release never carries it:
+its stdin and stdout. An example, so the release never carries it. The same
+test also runs the engine's rail (`Mobile.Rail`) through a second, dial-only
+helper built from this checkout, dialing the first at its UDP address:
 
 ```sh
 cargo build --release --locked
@@ -232,12 +242,13 @@ notices/generate.sh
 ```
 src/
   main.rs       stdio wiring, proxy variables dropped, exit codes, panic = 101
-  session.rs    the control loop: hello, start, set_relays, shutdown, errors
+  session.rs    the control loop: hello, start, set_relays, close, dial, shutdown, errors
   ndjson.rs     64 KiB line reader, the stdout writer task and its event sink
   protocol.rs   wire types (+ the fixture round trip) and op validation
   key.rs        the 32-byte, mode-0600 key file
-  endpoint.rs   Minimal preset, relay map, QUIC limits, accept loop, connections
+  endpoint.rs   Minimal preset, relay map, QUIC limits, accept loop (or refusing every connection), connections
   bridge.rs     preamble and the bounded two-way copy, with the Ending rules
+  dial.rs       the daemon's dials: connect, one stream, its socket, the same copy
   status.rs     relay and path watchers, sanitized error text
   shutdown.rs   the bounded graceful shutdown
 ```

@@ -113,14 +113,26 @@ pub async fn watch_relays(endpoint: Endpoint, sink: EventSink, stop: Cancellatio
     }
 }
 
+/// A path's kind and its relay URL (`None` for a direct path), or `None` for a
+/// transport that is neither a relay nor IP (none is configured in this helper).
+pub fn path_kind(remote: &TransportAddr) -> Option<(PathKind, Option<String>)> {
+    match remote {
+        TransportAddr::Relay(url) => Some((PathKind::Relay, Some(url.to_string()))),
+        TransportAddr::Ip(_) => Some((PathKind::Direct, None)),
+        _ => None,
+    }
+}
+
+/// The kind and relay of a connection's selected path, if it has one.
+pub fn selected_path(paths: &PathList<'_>) -> Option<(PathKind, Option<String>)> {
+    let selected = paths.iter().find(|p| p.is_selected())?;
+    path_kind(selected.remote_addr())
+}
+
 /// The `path` event for a selected path, or `None` for a transport that is
 /// neither a relay nor IP (none is configured in this helper).
 pub fn path_event(peer: &EndpointId, remote: &TransportAddr) -> Option<Event> {
-    let (kind, relay) = match remote {
-        TransportAddr::Relay(url) => (PathKind::Relay, Some(url.to_string())),
-        TransportAddr::Ip(_) => (PathKind::Direct, None),
-        _ => return None,
-    };
+    let (kind, relay) = path_kind(remote)?;
     Some(Event::Path {
         endpoint_id: peer.to_string(),
         kind,

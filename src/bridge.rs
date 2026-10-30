@@ -2,8 +2,9 @@
 //!
 //! The helper writes the 37-byte preamble (`FXB1`, the peer's kind, the peer's
 //! raw endpoint id), then copies bytes unchanged both ways through a 64 KiB
-//! buffer per direction, never parsing them. How each side ending ends the
-//! other is the contract's *Ending* list, implemented in [`splice`]:
+//! buffer per direction, never parsing them. A dialed stream (`crate::dial`) is
+//! copied by the same [`splice`], with no preamble. How each side ending ends
+//! the other is the contract's *Ending* list, implemented in [`splice`]:
 //!
 //! | The first thing that happens | What the helper does |
 //! |---|---|
@@ -161,7 +162,7 @@ enum DownEnd {
 /// Run both directions to their ends, letting each end the other as the
 /// contract's *Ending* list says. Both halves of the bridge connection are
 /// dropped, and so closed, when this returns.
-async fn splice(
+pub async fn splice(
     mut send: SendStream,
     recv: RecvStream,
     rd: OwnedReadHalf,
@@ -307,6 +308,13 @@ fn reset_down(send: &mut SendStream) -> DownEnd {
 pub fn abandon(mut send: SendStream, mut recv: RecvStream) {
     reset(&mut send, ABANDON_CODE);
     stop(&mut recv, ABANDON_CODE);
+}
+
+/// End a stream whose socket cannot be reached: reset its send half and stop
+/// reading it, both with code 2.
+pub fn abandon_unreachable(mut send: SendStream, mut recv: RecvStream) {
+    reset(&mut send, UNREACHABLE_CODE);
+    stop(&mut recv, UNREACHABLE_CODE);
 }
 
 fn reset(send: &mut SendStream, code: u32) {
