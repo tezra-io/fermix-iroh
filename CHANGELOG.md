@@ -9,6 +9,8 @@ The wire `protocol_version` is versioned separately from this crate; see
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-30
+
 Implements `protocol_version` 3, which lets the daemon reach another Fermix
 engine over the rail (M75). An engine that speaks version 2 refuses this
 helper, and an engine that speaks version 3 refuses every earlier one, so the
