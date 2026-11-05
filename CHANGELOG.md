@@ -44,6 +44,11 @@ that moves the engine to version 4.
   `apps/fermix_core/priv/iroh_helper/`, and `PROTOCOL_SOURCE` names that
   commit.
 
+### Fixed
+
+- The release notes name the wire's `protocol_version` 4. 0.3.0's still said
+  2, the version before it.
+
 ## [0.3.0] - 2026-10-30
 
 Implements `protocol_version` 3, which lets the daemon reach another Fermix
