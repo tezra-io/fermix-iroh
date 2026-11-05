@@ -167,6 +167,7 @@ impl Session {
                 alpn,
                 relays,
                 limits,
+                bind_port,
             } => {
                 let cfg = StartConfig::validate(
                     secret_key_path.as_deref(),
@@ -174,6 +175,7 @@ impl Session {
                     &alpn,
                     &relays,
                     &limits,
+                    bind_port,
                 );
                 match cfg {
                     Ok(cfg) => self.start(cfg).await,

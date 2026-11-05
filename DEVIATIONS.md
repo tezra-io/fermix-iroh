@@ -6,7 +6,8 @@ than the contract says, or where the contract is silent and a choice had to be
 made. Each entry gives what the helper does, why, the evidence, and wording the
 engine could adopt so the contract says it. Source references are to the pinned
 crates in Cargo's registry (`iroh-1.3.0`, `iroh-dns-1.3.0`, `noq-1.3.0`,
-`reqwest-0.13.5`, `hyper-util-0.1.21`, `n0-dns-resolver-0.1.0`).
+`reqwest-0.13.5`, `hyper-util-0.1.21`, `n0-dns-resolver-0.1.0`,
+`netwatch-0.19.3`).
 
 ## A. Where iroh 1.3.0 needs more than the contract says
 
@@ -178,7 +179,10 @@ must drop or reset its send half, or a renewal will wait for credit.
 - `path` is sent when the connection's *selected path* changes identity (iroh's
   `PathId`), so two consecutive `path` events for a peer can carry the same
   fields (one direct path replaced by another). It is not sent for a path that
-  is neither relay nor IP (none is configured).
+  is neither relay nor IP (none is configured). `dial_path` (protocol 4)
+  follows the same rule for a dialed connection, from the path `dialed` named:
+  `tests/dial.rs` sees a dial through the local relay move to a direct
+  loopback path within a second.
 - `relay` is sent after `ready` and when the home relay or its `connected`
   state changes; a new `error` text alone is not a change. The first `relay`
   often names no home relay (`null`, not connected) until iroh picks one.
@@ -279,3 +283,29 @@ reason is diagnostic only.
 
 *Proposed wording:* "A dial that fails once its connection is made closes it
 with code `0`, reason the failure's name."
+
+### B15. A `bind_port` is exactly that port, for IPv4 and IPv6 both
+
+Adopted in the contract with protocol 4 (`bind_port`); kept here as the
+evidence for that wording.
+
+- **iroh 1.3.0:** with no bind address given, the builder binds `0.0.0.0:0`,
+  required, and `[::]:0`, not required (`TransportConfig::default_ipv4` and
+  `default_ipv6`, `iroh/src/socket/transports.rs`), so a host without IPv6
+  still binds. A bind address the builder is given replaces that family's
+  default, required unless `BindOpts::set_is_required(false)`. Each socket
+  binds exactly its address: netwatch sets neither `SO_REUSEADDR` nor
+  `SO_REUSEPORT`, makes the IPv6 socket IPv6-only, refuses a socket that came
+  up on another port, and rebinds after a network change on the address it
+  had (`SocketState::bind` and `rebind`, `netwatch/src/udp.rs`).
+- **What the helper does:** with `bind_port`, it clears iroh's defaults and
+  binds `0.0.0.0:<port>` and `[::]:<port>`, both required, so either one
+  failing ends the bind (`BindError::Sockets`). The `bind_failed` message names
+  the port and the system's reason, for example `UDP port 4100 could not be
+  bound: Failed to bind sockets: Address already in use (os error 48)`. A host
+  whose kernel has no IPv6 at all cannot take a `bind_port`; without one it
+  binds as before. The hermetic suite's loopback scope binds 127.0.0.1's port
+  alone (`endpoint::ip_binds`).
+- **Why both required:** the port exists so a peer can dial an address it
+  recorded. A helper that came up without its IPv6 half would leave a recorded
+  IPv6 address dead with nothing but the bound-sockets log to say so.

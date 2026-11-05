@@ -13,7 +13,7 @@
 //! refuses every incoming connection before its handshake ([`refuse_all`]).
 
 use std::collections::{BTreeMap, HashMap};
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -59,12 +59,13 @@ pub const PROXY_VARIABLES: [&str; 8] = [
 /// The TLS alert a server sends when no offered ALPN matches.
 const TLS_ALERT_NO_APPLICATION_PROTOCOL: u8 = 120;
 
-/// Where the endpoint binds its UDP sockets.
+/// Where the endpoint binds its UDP sockets, on the port `start` names or on
+/// ports the system picks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BindScope {
     /// iroh's default: every interface, IPv4 and IPv6. The released helper.
     AllInterfaces,
-    /// 127.0.0.1 only. Hermetic tests.
+    /// 127.0.0.1 only, `bind_port` included. Hermetic tests.
     Loopback,
 }
 
@@ -147,8 +148,28 @@ fn relay_config(relay: &Relay) -> RelayConfig {
     )
 }
 
+/// The UDP addresses the endpoint binds, or `None` for iroh's own: every
+/// interface, IPv4 and, where the host has it, IPv6, on ports the system picks.
+/// A `bind_port` is that port for IPv4 and IPv6 both, each required, so a port
+/// either family cannot have is `bind_failed`, never another port; on loopback
+/// it is 127.0.0.1's port alone.
+fn ip_binds(scope: BindScope, port: Option<u16>) -> Option<Vec<SocketAddr>> {
+    match (scope, port) {
+        (BindScope::AllInterfaces, None) => None,
+        (BindScope::AllInterfaces, Some(port)) => Some(vec![
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)),
+            SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)),
+        ]),
+        (BindScope::Loopback, port) => Some(vec![SocketAddr::from((
+            Ipv4Addr::LOCALHOST,
+            port.unwrap_or(0),
+        ))]),
+    }
+}
+
 /// Bind the endpoint for a validated `start`. The error is the text of the
-/// `bind_failed` event.
+/// `bind_failed` event; with `bind_port` it names the port and the system's
+/// reason.
 pub async fn bind(key: SecretKey, cfg: &StartConfig, net: &Network) -> Result<Endpoint, String> {
     let relays: RelayMap = cfg.relays.iter().map(relay_config).collect();
     let dns = DnsResolver::builder()
@@ -163,14 +184,29 @@ pub async fn bind(key: SecretKey, cfg: &StartConfig, net: &Network) -> Result<En
         .ca_tls_config(net.ca_tls.clone())
         .dns_resolver(dns)
         .portmapper_config(net.portmapper.clone());
-    let builder = match net.scope {
-        BindScope::AllInterfaces => builder,
-        BindScope::Loopback => builder
-            .clear_ip_transports()
-            .bind_addr((Ipv4Addr::LOCALHOST, 0))
+    let builder = match ip_binds(net.scope, cfg.bind_port) {
+        None => builder,
+        Some(addrs) => addrs
+            .into_iter()
+            .try_fold(builder.clear_ip_transports(), |b, addr| b.bind_addr(addr))
             .map_err(|e| e.to_string())?,
     };
-    builder.bind().await.map_err(|e| e.to_string())
+    builder.bind().await.map_err(|e| match cfg.bind_port {
+        Some(port) => format!("UDP port {port} could not be bound: {}", error_chain(&e)),
+        None => e.to_string(),
+    })
+}
+
+/// An error and each of its sources, joined by `: `.
+fn error_chain(err: &dyn std::error::Error) -> String {
+    let mut text = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        text.push_str(": ");
+        text.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    text
 }
 
 /// The relay map the endpoint currently has, as the daemon last named it.
@@ -785,6 +821,28 @@ mod tests {
 
     fn at(start: Instant, secs: u64) -> Instant {
         start + Duration::from_secs(secs)
+    }
+
+    #[test]
+    fn a_bind_port_binds_that_port_for_both_families_or_for_loopback_alone() {
+        let v4 = |ip: Ipv4Addr, port: u16| SocketAddr::from((ip, port));
+        let v6 = |ip: Ipv6Addr, port: u16| SocketAddr::from((ip, port));
+        assert_eq!(ip_binds(BindScope::AllInterfaces, None), None);
+        assert_eq!(
+            ip_binds(BindScope::AllInterfaces, Some(4100)),
+            Some(vec![
+                v4(Ipv4Addr::UNSPECIFIED, 4100),
+                v6(Ipv6Addr::UNSPECIFIED, 4100)
+            ])
+        );
+        assert_eq!(
+            ip_binds(BindScope::Loopback, None),
+            Some(vec![v4(Ipv4Addr::LOCALHOST, 0)])
+        );
+        assert_eq!(
+            ip_binds(BindScope::Loopback, Some(4100)),
+            Some(vec![v4(Ipv4Addr::LOCALHOST, 4100)])
+        );
     }
 
     #[test]

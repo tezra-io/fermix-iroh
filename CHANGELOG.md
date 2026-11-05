@@ -9,6 +9,41 @@ The wire `protocol_version` is versioned separately from this crate; see
 
 ## [Unreleased]
 
+Implements `protocol_version` 4, which keeps an Always On server at the address
+its peers recorded and tells the daemon when a dialed link goes direct (M75).
+An engine that speaks version 3 refuses this helper, and an engine that speaks
+version 4 refuses every earlier one, so the engine pins it in the same change
+that moves the engine to version 4.
+
+### Added
+
+- `start`'s optional `bind_port`, 1 to 65,535 (absent, never `null`, as every
+  optional field): the endpoint binds that UDP port on every interface, for
+  IPv4 and IPv6 both, so a server stays at `<address>:<port>` across restarts
+  and a peer that recorded the address dials it there even when no relay
+  answers. A port either family cannot have (another socket holds it, the
+  system refuses it, or the host has no IPv6) is `bind_failed`, whose message
+  names the port and the system's reason; the helper never binds another port
+  instead. Without it the endpoint binds as before, on ports the system picks.
+  On the test suite's loopback scope it is 127.0.0.1's port alone.
+- `dial_path {dial_id, kind, relay}`: each change of a dialed connection's
+  selected path after `dialed`, until the dial's `dial_closed`, which follows
+  the last one. iroh usually opens a dial on the relay and moves it to a direct
+  path once hole punching succeeds, and `dialed` reported only the first path.
+  A dialed connection still sends no `path` or `closed`, and nothing new when
+  it closes; accepted connections' `path` events are unchanged.
+- Tests: a `bind_port` another socket holds is `bind_failed` naming the port,
+  a helper is dialed at the port its `start` named with no relay serving, and
+  a dial through the local relay reports its move to a direct path.
+
+### Changed
+
+- `protocol/` holds the protocol 4 export, written here ahead of the engine:
+  `PROTOCOL.md`, `hello.json`, and the new `start_bind_port.json` and
+  `dial_path.json`. The engine commits the same bytes at
+  `apps/fermix_core/priv/iroh_helper/`, and `PROTOCOL_SOURCE` names that
+  commit.
+
 ## [0.3.0] - 2026-10-30
 
 Implements `protocol_version` 3, which lets the daemon reach another Fermix

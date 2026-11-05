@@ -18,7 +18,7 @@ use iroh::{EndpointId, RelayUrl};
 use serde::{Deserialize, Deserializer, Serialize};
 
 /// The single integer version carried in `hello`. Pinned to `protocol/PROTOCOL.md`.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// The longest control line, in bytes, not counting its terminating `\n`.
 pub const MAX_LINE_BYTES: usize = 64 * 1024;
@@ -197,6 +197,15 @@ pub enum Event {
         /// The relay URL, or `None` for a direct path.
         relay: Option<String>,
     },
+    /// A dialed connection's selected path changed after `dialed`.
+    DialPath {
+        /// The daemon's id for the dial.
+        dial_id: String,
+        /// Relay or direct.
+        kind: PathKind,
+        /// The relay URL, or `None` for a direct path.
+        relay: Option<String>,
+    },
     /// A dial ended without a stream.
     DialFailed {
         /// The daemon's id for the dial.
@@ -299,6 +308,13 @@ pub enum Op {
         relays: Vec<RelaySpec>,
         /// Connection, stream and window bounds.
         limits: Limits,
+        /// The UDP port to bind; absent for ports the system picks.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "present"
+        )]
+        bind_port: Option<u16>,
     },
     /// Replace the endpoint's relay map.
     SetRelays {
@@ -421,6 +437,9 @@ pub struct StartConfig {
     pub relays: Vec<Relay>,
     /// The bounds, each within its contract range.
     pub limits: ValidLimits,
+    /// The UDP port the endpoint binds, never 0; `None` for ports the system
+    /// picks.
+    pub bind_port: Option<u16>,
 }
 
 /// [`Limits`] after range checks, in the widths the endpoint uses them at.
@@ -447,6 +466,7 @@ impl StartConfig {
         alpn: &str,
         relays: &[RelaySpec],
         limits: &Limits,
+        bind_port: Option<u16>,
     ) -> Result<Self, RequestError> {
         let kind = kind_for_alpn(alpn.as_bytes()).ok_or_else(|| {
             RequestError::invalid("alpn", format!("only {ALPN_MOBILE} is accepted"))
@@ -457,7 +477,17 @@ impl StartConfig {
             kind,
             relays: validate_relays(relays)?,
             limits: validate_limits(limits)?,
+            bind_port: validate_bind_port(bind_port)?,
         })
+    }
+}
+
+/// A `bind_port`, when present, is 1 to 65,535: port 0 would have the system
+/// pick one, which is what its absence means.
+fn validate_bind_port(bind_port: Option<u16>) -> Result<Option<u16>, RequestError> {
+    match bind_port {
+        Some(0) => Err(RequestError::invalid("bind_port", "must not be 0")),
+        port => Ok(port),
     }
 }
 
@@ -696,12 +726,13 @@ mod tests {
             ALPN_MOBILE,
             relays,
             limits,
+            None,
         )
     }
 
     fn validate(key: &str, socket: &str, alpn: &str) -> Result<StartConfig, RequestError> {
         let relays = [relay("https://r.example/")];
-        StartConfig::validate(Some(key), Some(socket), alpn, &relays, &limits())
+        StartConfig::validate(Some(key), Some(socket), alpn, &relays, &limits(), None)
     }
 
     const PEER: &str = "79b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664";
@@ -782,16 +813,64 @@ mod tests {
     #[test]
     fn a_start_without_key_and_socket_only_dials_and_one_without_the_other_is_refused() {
         let relays = [relay("https://r.example/")];
-        let dial_only = StartConfig::validate(None, None, ALPN_MOBILE, &relays, &limits());
+        let dial_only = StartConfig::validate(None, None, ALPN_MOBILE, &relays, &limits(), None);
         assert_eq!(dial_only.unwrap().listen, None);
         for (key, socket, field) in [
             (Some("/k"), None, "bridge_socket"),
             (None, Some("/s"), "secret_key_path"),
         ] {
-            let half = StartConfig::validate(key, socket, ALPN_MOBILE, &relays, &limits());
+            let half = StartConfig::validate(key, socket, ALPN_MOBILE, &relays, &limits(), None);
             assert!(
                 matches!(&half, Err(RequestError::Invalid { field: f, .. }) if *f == field),
                 "{half:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bind_port_is_1_to_65535_and_absent_means_the_system_picks() {
+        let relays = [relay("https://r.example/")];
+        let bind = |port| {
+            StartConfig::validate(
+                Some("/k"),
+                Some("/s"),
+                ALPN_MOBILE,
+                &relays,
+                &limits(),
+                port,
+            )
+        };
+        assert_eq!(bind(None).unwrap().bind_port, None);
+        assert_eq!(bind(Some(1)).unwrap().bind_port, Some(1));
+        assert_eq!(bind(Some(65_535)).unwrap().bind_port, Some(65_535));
+        assert!(matches!(
+            bind(Some(0)),
+            Err(RequestError::Invalid {
+                field: "bind_port",
+                ..
+            })
+        ));
+        // An endpoint that only dials may name one too.
+        let dial_only =
+            StartConfig::validate(None, None, ALPN_MOBILE, &relays, &limits(), Some(4100));
+        assert_eq!(dial_only.unwrap().bind_port, Some(4100));
+    }
+
+    #[test]
+    fn a_bind_port_outside_a_port_number_or_null_is_malformed() {
+        let start = r#"{"op":"start","alpn":"fermix/mobile/1","relays":[{"url":"https://r/","quic_port":1}],"limits":{"max_connections":1,"max_streams_per_connection":1,"stream_receive_window":65536,"connection_receive_window":65536,"send_window":65536}"#;
+        assert!(matches!(
+            decode_op(&format!("{start},\"bind_port\":4100}}")),
+            Ok(Op::Start {
+                bind_port: Some(4100),
+                ..
+            })
+        ));
+        for bad in ["65536", "-1", "null", "\"4100\"", "4100.5"] {
+            let line = format!("{start},\"bind_port\":{bad}}}");
+            assert!(
+                matches!(decode_op(&line), Err(RequestError::Malformed(_))),
+                "{line}"
             );
         }
     }

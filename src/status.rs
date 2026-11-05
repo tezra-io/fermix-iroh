@@ -1,4 +1,4 @@
-//! Relay and path status, turned into `relay` and `path` events.
+//! Relay and path status, turned into `relay`, `path` and `dial_path` events.
 //!
 //! Text that comes from iroh (a relay's error) is relay-influenced: the daemon
 //! logs it and never matches on it. It is reduced to its first line, stripped of
@@ -123,10 +123,11 @@ pub fn path_kind(remote: &TransportAddr) -> Option<(PathKind, Option<String>)> {
     }
 }
 
-/// The kind and relay of a connection's selected path, if it has one.
-pub fn selected_path(paths: &PathList<'_>) -> Option<(PathKind, Option<String>)> {
+/// The id, kind and relay of a connection's selected path, if it has one.
+pub fn selected_path(paths: &PathList<'_>) -> Option<(PathId, PathKind, Option<String>)> {
     let selected = paths.iter().find(|p| p.is_selected())?;
-    path_kind(selected.remote_addr())
+    let (kind, relay) = path_kind(selected.remote_addr())?;
+    Some((selected.id(), kind, relay))
 }
 
 /// The `path` event for a selected path, or `None` for a transport that is
@@ -178,6 +179,41 @@ impl PathTracker {
         let event = path_event(&self.peer, selected.remote_addr())?;
         self.reported = true;
         Some(event)
+    }
+}
+
+/// Tracks a dialed connection's selected path after `dialed`: reports each
+/// change once, as a `dial_path` naming the dial. The dial's end is its
+/// `dial_closed`, so nothing is reported when the connection closes.
+pub struct DialPathTracker {
+    dial_id: String,
+    selected: PathId,
+}
+
+impl DialPathTracker {
+    /// A tracker for the dial `dial_id`, whose `dialed` named the path
+    /// `selected`.
+    pub fn new(dial_id: &str, selected: PathId) -> Self {
+        DialPathTracker {
+            dial_id: dial_id.to_string(),
+            selected,
+        }
+    }
+
+    /// The `dial_path` to send for a snapshot of the connection's paths, if
+    /// its selected path changed since the last snapshot.
+    pub fn observe(&mut self, paths: &PathList<'_>) -> Option<Event> {
+        let selected = paths.iter().find(|p| p.is_selected())?;
+        if self.selected == selected.id() {
+            return None;
+        }
+        self.selected = selected.id();
+        let (kind, relay) = path_kind(selected.remote_addr())?;
+        Some(Event::DialPath {
+            dial_id: self.dial_id.clone(),
+            kind,
+            relay,
+        })
     }
 }
 

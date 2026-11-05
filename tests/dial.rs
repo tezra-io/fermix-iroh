@@ -18,9 +18,10 @@ use iroh::endpoint::{
     Connection, ConnectionError, PortmapperConfig, QuicTransportConfig, VarInt, presets,
 };
 use iroh::{Endpoint, EndpointId, RelayMode, SecretKey};
+use serde_json::json;
 use support::{
     ALPN, Helper, TestRelay, accept_bridge, bounded, dead_relay, dial_op, expected_preamble,
-    test_network, within,
+    test_network, unused_udp_port, within,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -202,6 +203,107 @@ async fn a_dial_reaches_a_peer_directly_with_no_relay_and_the_far_side_can_end_i
         assert_eq!(last, b"closing");
         drop(unix);
         dial_closed(&mut dialer, "direct").await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dial_reaches_a_helper_at_the_port_its_start_named_with_no_relay() {
+    bounded(async {
+        // The address a peer recorded for the helper: its host and the port
+        // its start names, which no restart changes.
+        let recorded = SocketAddr::from((Ipv4Addr::LOCALHOST, unused_udp_port()));
+        let mut listener = Helper::spawn().await;
+        let bridge = listener.listen_bridge();
+        let mut start = listener.start_op_for(&[dead_relay()], true);
+        start["bind_port"] = json!(recorded.port());
+        let (listener_id, bound) = listener.start_with_op(&start, true).await;
+        assert_eq!(bound, recorded);
+
+        let mut dialer = Helper::spawn().await;
+        dialer.start_on(&[dead_relay()], false).await;
+        let socket = dial_socket(&dialer, "hint");
+        let dial_listener = UnixListener::bind(&socket).unwrap();
+        let op = dial_op("hint", listener_id, &[dead_relay()], &socket, &[recorded]);
+        dialer.send(&op).await;
+
+        assert_eq!(
+            dial_answer(&mut dialer, "hint").await,
+            Event::Dialed {
+                dial_id: "hint".into(),
+                kind: PathKind::Direct,
+                relay: None
+            }
+        );
+        let mut unix = accept_dial(&dial_listener).await;
+        unix.write_all(b"hint").await.unwrap();
+        let (mut far, _) = accept_bridge(&bridge).await;
+        assert_eq!(read_exactly(&mut far, 4).await, b"hint");
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dial_that_moves_from_the_relay_to_a_direct_path_reports_the_move() {
+    bounded(async {
+        let relay = TestRelay::start().await;
+        let mut listener = Helper::spawn().await;
+        let bridge = listener.listen_bridge();
+        listener.start(&[&relay], 8, &relay).await;
+
+        let mut dialer = Helper::spawn().await;
+        dialer.start_on(&[relay.spec()], false).await;
+        dialer.wait_relay_connected(&relay).await;
+        let socket = dial_socket(&dialer, "up");
+        let dial_listener = UnixListener::bind(&socket).unwrap();
+        // The relay alone: the connection opens there, and iroh learns the
+        // listener's loopback address through it and moves to that.
+        let op = dial_op("up", listener.endpoint_id(), &[relay.spec()], &socket, &[]);
+        dialer.send(&op).await;
+
+        assert_eq!(
+            dial_answer(&mut dialer, "up").await,
+            Event::Dialed {
+                dial_id: "up".into(),
+                kind: PathKind::Relay,
+                relay: Some(relay.url.to_string())
+            }
+        );
+        let moved = dialer
+            .expect("the dial's direct path", |e| {
+                matches!(e, Event::DialPath { dial_id, kind: PathKind::Direct, .. } if dial_id == "up")
+            })
+            .await;
+        assert_eq!(
+            moved,
+            Event::DialPath {
+                dial_id: "up".into(),
+                kind: PathKind::Direct,
+                relay: None
+            }
+        );
+
+        // The stream carries on over the new path, and `dial_closed` ends the
+        // dial: a dialed connection reports no `path` and no `closed`.
+        let mut unix = accept_dial(&dial_listener).await;
+        unix.write_all(b"after").await.unwrap();
+        let (mut far, _) = accept_bridge(&bridge).await;
+        assert_eq!(read_exactly(&mut far, 5).await, b"after");
+        drop(unix);
+        let mut last = Vec::new();
+        within("the far bridge's EOF", far.read_to_end(&mut last))
+            .await
+            .unwrap();
+        drop(far);
+        dialer
+            .expect("dial_closed", |e| {
+                assert!(
+                    !matches!(e, Event::Path { .. } | Event::Closed { .. }),
+                    "a dialed connection sent {e:?}"
+                );
+                matches!(e, Event::DialClosed { dial_id } if dial_id == "up")
+            })
+            .await;
     })
     .await;
 }

@@ -10,8 +10,10 @@
 //! | all of the above, together | `timeout` once [`crate::endpoint::Timings::dial_deadline`] passes |
 //!
 //! Then `dialed`, and the stream is copied by the same [`bridge::splice`] as an
-//! accepted one, with no preamble; when both directions have ended the
-//! connection is closed with code 0, reason `done`, and `dial_closed` is sent.
+//! accepted one, with no preamble; meanwhile each change of the connection's
+//! selected path is a `dial_path`. When both directions have ended the
+//! connection is closed with code 0, reason `done`, and `dial_closed` is sent,
+//! after the last `dial_path`.
 //! A dial that fails once its connection is made closes it with code 0 and the
 //! failure's name as the reason. At most [`MAX_DIALS`] dials are in flight,
 //! from the op until their last event; a dial past that is `dial_failed`
@@ -24,11 +26,14 @@
 use std::collections::HashSet;
 use std::future::Future;
 use std::path::Path;
+use std::pin::pin;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use iroh::endpoint::{ConnectError, Connection, ConnectionError, RecvStream, SendStream, VarInt};
+use iroh::endpoint::{
+    ConnectError, Connection, ConnectionError, PathId, RecvStream, SendStream, VarInt,
+};
 use iroh::{Endpoint, EndpointAddr, TransportAddr};
 use tokio::net::UnixStream;
 use tokio::time::Instant;
@@ -38,7 +43,7 @@ use tokio_util::task::TaskTracker;
 use crate::bridge;
 use crate::ndjson::EventSink;
 use crate::protocol::{DialConfig, DialFailure, Event, LogLevel, PathKind};
-use crate::status::{sanitize_error_text, selected_path};
+use crate::status::{DialPathTracker, sanitize_error_text, selected_path};
 
 /// The most dials in flight at once.
 pub const MAX_DIALS: usize = 8;
@@ -171,6 +176,7 @@ struct Opened {
     send: SendStream,
     recv: RecvStream,
     unix: UnixStream,
+    path: PathId,
     kind: PathKind,
     relay: Option<String>,
 }
@@ -221,11 +227,14 @@ impl Run {
             .map_err(|e| connect_failed(&e))
     }
 
+    /// Send `dialed`, then copy the stream, reporting each path change, until
+    /// both directions have ended.
     async fn copy(&self, dial_id: &str, conn: Connection, opened: Opened, place: Active) {
         let Opened {
             send,
             recv,
             unix,
+            path,
             kind,
             relay,
         } = opened;
@@ -236,7 +245,15 @@ impl Run {
         };
         self.sink.emit(dialed).await;
         let (rd, wr) = unix.into_split();
-        bridge::splice(send, recv, rd, wr, &self.stop).await;
+        // One task polls both, so the copy goes on while a `dial_path` waits
+        // for the daemon to read it; one cut short by the copy's end is
+        // dropped, since `dial_closed` follows.
+        let mut copying = pin!(bridge::splice(send, recv, rd, wr, &self.stop));
+        let tracker = DialPathTracker::new(dial_id, path);
+        tokio::select! {
+            () = &mut copying => {}
+            () = self.report_paths(&conn, tracker) => copying.await,
+        }
         if self.stop.is_cancelled() {
             conn.close(VarInt::from_u32(0), b"shutdown");
             return;
@@ -247,6 +264,22 @@ impl Run {
             dial_id: dial_id.to_string(),
         };
         self.sink.emit(closed).await;
+    }
+
+    /// Send a `dial_path` for each change of the connection's selected path,
+    /// until its paths end with it or the helper stops.
+    async fn report_paths(&self, conn: &Connection, mut tracker: DialPathTracker) {
+        let mut snapshots = conn.paths_stream();
+        loop {
+            let snapshot = tokio::select! {
+                _ = self.stop.cancelled() => return,
+                snapshot = snapshots.next() => snapshot,
+            };
+            let Some(paths) = snapshot else { return };
+            if let Some(event) = tracker.observe(&paths) {
+                self.sink.emit(event).await;
+            }
+        }
     }
 
     async fn fail(&self, dial_id: &str, failed: Failed, place: Active) {
@@ -267,12 +300,13 @@ async fn open(conn: &Connection, socket: &Path) -> Result<Opened, Failed> {
         .open_bi()
         .await
         .map_err(|e| Failed::new(connection_failure(&e), e.to_string()))?;
-    let (kind, relay) = path_of(conn).await?;
+    let (path, kind, relay) = path_of(conn).await?;
     match connect_socket(socket).await {
         Ok(unix) => Ok(Opened {
             send,
             recv,
             unix,
+            path,
             kind,
             relay,
         }),
@@ -315,7 +349,7 @@ fn address(cfg: &DialConfig) -> EndpointAddr {
 
 /// The selected path once the connection has one. iroh selects one as the
 /// handshake completes; a connection that ends first is `refused`.
-async fn path_of(conn: &Connection) -> Result<(PathKind, Option<String>), Failed> {
+async fn path_of(conn: &Connection) -> Result<(PathId, PathKind, Option<String>), Failed> {
     let mut snapshots = conn.paths_stream();
     while let Some(paths) = snapshots.next().await {
         if let Some(path) = selected_path(&paths) {
