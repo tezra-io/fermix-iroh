@@ -83,7 +83,7 @@ stop before the endpoint binds.
 
 | Suite | What it pins |
 |---|---|
-| unit tests (`src/`) | validation ranges (`start`'s key and socket together or not at all, its `bind_port`, every `dial` field), the addresses a `bind_port` binds, key file checks, framing, text sanitizing, the connection bound |
+| unit tests (`src/`) | validation ranges (`start`'s key and socket together or not at all, its `bind_port`, every `dial` field), the addresses a `bind_port` binds (IPv4 alone only on a kernel with no IPv6), key file checks, framing, text sanitizing, the connection bound |
 | `tests/fixtures.rs` | the vendored contract, byte for byte |
 | `tests/framing_props.rs` | property tests: arbitrary bytes never panic the reader or the decoder, no line exceeds 64 KiB, an over-long line is refused |
 | `tests/process.rs` | the binary over real pipes: `hello` first, exit codes, every failure before bind, a `dial` before `ready` |

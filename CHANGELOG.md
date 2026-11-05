@@ -21,11 +21,15 @@ that moves the engine to version 4.
   optional field): the endpoint binds that UDP port on every interface, for
   IPv4 and IPv6 both, so a server stays at `<address>:<port>` across restarts
   and a peer that recorded the address dials it there even when no relay
-  answers. A port either family cannot have (another socket holds it, the
-  system refuses it, or the host has no IPv6) is `bind_failed`, whose message
-  names the port and the system's reason; the helper never binds another port
-  instead. Without it the endpoint binds as before, on ports the system picks.
-  On the test suite's loopback scope it is 127.0.0.1's port alone.
+  answers. On a kernel with no IPv6 at all (creating an IPv6 socket fails with
+  "address family not supported", asked once before the bind) it binds the
+  port for IPv4 alone and says so in an `info` `log`. A port either family
+  cannot otherwise have (another socket holds it, the system refuses it, an
+  address cannot be assigned) is `bind_failed`, whose message names the port
+  and the system's reason; the helper never binds another port, and never
+  leaves IPv6 out for any other reason. Without it the endpoint binds as
+  before, on ports the system picks. On the test suite's loopback scope it is
+  127.0.0.1's port alone.
 - `dial_path {dial_id, kind, relay}`: each change of a dialed connection's
   selected path after `dialed`, until the dial's `dial_closed`, which follows
   the last one. iroh usually opens a dial on the relay and moves it to a direct
@@ -33,8 +37,11 @@ that moves the engine to version 4.
   A dialed connection still sends no `path` or `closed`, and nothing new when
   it closes; accepted connections' `path` events are unchanged.
 - Tests: a `bind_port` another socket holds is `bind_failed` naming the port,
-  a helper is dialed at the port its `start` named with no relay serving, and
-  a dial through the local relay reports its move to a direct path.
+  a helper is dialed at the port its `start` named with no relay serving, a
+  dial through the local relay reports its move to a direct path, and the bind
+  plan leaves IPv6 out only for "address family not supported" (injected
+  errors, real ones included: a port in use, an address the host lacks, the
+  two permission errors).
 
 ### Changed
 
