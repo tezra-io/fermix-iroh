@@ -9,6 +9,8 @@ The wire `protocol_version` is versioned separately from this crate; see
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-05
+
 Implements `protocol_version` 4, which keeps an Always On server at the address
 its peers recorded and tells the daemon when a dialed link goes direct (M75).
 An engine that speaks version 3 refuses this helper, and an engine that speaks
@@ -45,11 +47,10 @@ that moves the engine to version 4.
 
 ### Changed
 
-- `protocol/` holds the protocol 4 export, written here ahead of the engine:
-  `PROTOCOL.md`, `hello.json`, and the new `start_bind_port.json` and
-  `dial_path.json`. The engine commits the same bytes at
-  `apps/fermix_core/priv/iroh_helper/`, and `PROTOCOL_SOURCE` names that
-  commit.
+- `protocol/` is the engine's protocol 4 export at fermix bdf540f8, which
+  `PROTOCOL_SOURCE` now names: `PROTOCOL.md`, `hello.json`, and the new
+  `start_bind_port.json` and `dial_path.json`. It was written here first and
+  committed in the engine byte for byte.
 
 ### Fixed
 
