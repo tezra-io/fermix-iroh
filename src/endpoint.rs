@@ -13,7 +13,7 @@
 //! refuses every incoming connection before its handshake ([`refuse_all`]).
 
 use std::collections::{BTreeMap, HashMap};
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -59,12 +59,13 @@ pub const PROXY_VARIABLES: [&str; 8] = [
 /// The TLS alert a server sends when no offered ALPN matches.
 const TLS_ALERT_NO_APPLICATION_PROTOCOL: u8 = 120;
 
-/// Where the endpoint binds its UDP sockets.
+/// Where the endpoint binds its UDP sockets, on the port `start` names or on
+/// ports the system picks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BindScope {
     /// iroh's default: every interface, IPv4 and IPv6. The released helper.
     AllInterfaces,
-    /// 127.0.0.1 only. Hermetic tests.
+    /// 127.0.0.1 only, `bind_port` included. Hermetic tests.
     Loopback,
 }
 
@@ -147,9 +148,100 @@ fn relay_config(relay: &Relay) -> RelayConfig {
     )
 }
 
-/// Bind the endpoint for a validated `start`. The error is the text of the
-/// `bind_failed` event.
-pub async fn bind(key: SecretKey, cfg: &StartConfig, net: &Network) -> Result<Endpoint, String> {
+/// `EAFNOSUPPORT`, "address family not supported", in macOS's `<sys/errno.h>`.
+#[cfg(target_os = "macos")]
+const EAFNOSUPPORT: i32 = 47;
+/// `EAFNOSUPPORT`, "address family not supported", in Linux's
+/// `asm-generic/errno.h` (both release architectures).
+#[cfg(target_os = "linux")]
+const EAFNOSUPPORT: i32 = 97;
+
+/// How the endpoint binds its UDP sockets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BindPlan {
+    /// iroh's own: every interface, IPv4 and, where the host has it, IPv6, on
+    /// ports the system picks.
+    Iroh,
+    /// Exactly these addresses, each required: one the system refuses is
+    /// `bind_failed`, never another address or port.
+    Exactly(Vec<SocketAddr>),
+    /// A `bind_port` on a kernel with no IPv6 at all: that port for IPv4
+    /// alone, required, and a `log` that says so.
+    Ipv4Only(SocketAddr),
+}
+
+impl BindPlan {
+    /// The plan for a `start` in `scope`. A `bind_port` is that port for IPv4
+    /// and IPv6 both, unless `kernel_has_ipv6`, asked only for a `bind_port`
+    /// on every interface, says the kernel has no IPv6; on loopback it is
+    /// 127.0.0.1's port alone.
+    pub fn new(
+        scope: BindScope,
+        port: Option<u16>,
+        kernel_has_ipv6: impl FnOnce() -> bool,
+    ) -> Self {
+        match (scope, port) {
+            (BindScope::AllInterfaces, None) => BindPlan::Iroh,
+            (BindScope::AllInterfaces, Some(port)) => Self::fixed(port, kernel_has_ipv6()),
+            (BindScope::Loopback, port) => BindPlan::Exactly(vec![SocketAddr::from((
+                Ipv4Addr::LOCALHOST,
+                port.unwrap_or(0),
+            ))]),
+        }
+    }
+
+    fn fixed(port: u16, ipv6: bool) -> Self {
+        let v4 = SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
+        if !ipv6 {
+            return BindPlan::Ipv4Only(v4);
+        }
+        BindPlan::Exactly(vec![v4, SocketAddr::from((Ipv6Addr::UNSPECIFIED, port))])
+    }
+
+    /// The addresses to bind, or `None` for iroh's own.
+    fn addrs(&self) -> Option<Vec<SocketAddr>> {
+        match self {
+            BindPlan::Iroh => None,
+            BindPlan::Exactly(addrs) => Some(addrs.clone()),
+            BindPlan::Ipv4Only(addr) => Some(vec![*addr]),
+        }
+    }
+
+    /// The `log` the daemon gets about this plan after `ready`, if any.
+    pub fn notice(&self) -> Option<String> {
+        match self {
+            BindPlan::Ipv4Only(addr) => Some(format!(
+                "no IPv6 on this host: UDP port {} is bound for IPv4 only",
+                addr.port()
+            )),
+            BindPlan::Iroh | BindPlan::Exactly(_) => None,
+        }
+    }
+}
+
+/// Whether the kernel has IPv6 at all: whether it can make an IPv6 UDP socket.
+/// The socket is bound to `[::1]:0` and dropped at once, so nothing reaches
+/// the network.
+pub fn kernel_has_ipv6() -> bool {
+    ipv6_supported(UdpSocket::bind((Ipv6Addr::LOCALHOST, 0)).map(drop))
+}
+
+/// Only "address family not supported" means the kernel has no IPv6. Any
+/// other failure (no `::1`, a refused bind) keeps IPv6 in the plan, so the
+/// real bind reports it as `bind_failed`.
+fn ipv6_supported(probe: std::io::Result<()>) -> bool {
+    !matches!(probe, Err(e) if e.raw_os_error() == Some(EAFNOSUPPORT))
+}
+
+/// Bind the endpoint for a validated `start` by `plan`. The error is the text
+/// of the `bind_failed` event; with `bind_port` it names the port and the
+/// system's reason.
+pub async fn bind(
+    key: SecretKey,
+    cfg: &StartConfig,
+    net: &Network,
+    plan: &BindPlan,
+) -> Result<Endpoint, String> {
     let relays: RelayMap = cfg.relays.iter().map(relay_config).collect();
     let dns = DnsResolver::builder()
         .with_system_defaults()
@@ -163,14 +255,29 @@ pub async fn bind(key: SecretKey, cfg: &StartConfig, net: &Network) -> Result<En
         .ca_tls_config(net.ca_tls.clone())
         .dns_resolver(dns)
         .portmapper_config(net.portmapper.clone());
-    let builder = match net.scope {
-        BindScope::AllInterfaces => builder,
-        BindScope::Loopback => builder
-            .clear_ip_transports()
-            .bind_addr((Ipv4Addr::LOCALHOST, 0))
+    let builder = match plan.addrs() {
+        None => builder,
+        Some(addrs) => addrs
+            .into_iter()
+            .try_fold(builder.clear_ip_transports(), |b, addr| b.bind_addr(addr))
             .map_err(|e| e.to_string())?,
     };
-    builder.bind().await.map_err(|e| e.to_string())
+    builder.bind().await.map_err(|e| match cfg.bind_port {
+        Some(port) => format!("UDP port {port} could not be bound: {}", error_chain(&e)),
+        None => e.to_string(),
+    })
+}
+
+/// An error and each of its sources, joined by `: `.
+fn error_chain(err: &dyn std::error::Error) -> String {
+    let mut text = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        text.push_str(": ");
+        text.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    text
 }
 
 /// The relay map the endpoint currently has, as the daemon last named it.
@@ -785,6 +892,76 @@ mod tests {
 
     fn at(start: Instant, secs: u64) -> Instant {
         start + Duration::from_secs(secs)
+    }
+
+    fn never_asked() -> bool {
+        panic!("the kernel is asked about IPv6 only for a bind_port on every interface")
+    }
+
+    #[test]
+    fn a_bind_port_binds_that_port_for_both_families_or_for_loopback_alone() {
+        let v4 = |ip: Ipv4Addr, port: u16| SocketAddr::from((ip, port));
+        let v6 = |ip: Ipv6Addr, port: u16| SocketAddr::from((ip, port));
+        let iroh = BindPlan::new(BindScope::AllInterfaces, None, never_asked);
+        assert_eq!(iroh, BindPlan::Iroh);
+        assert_eq!(iroh.addrs(), None);
+        let both = BindPlan::new(BindScope::AllInterfaces, Some(4100), || true);
+        assert_eq!(
+            both.addrs(),
+            Some(vec![
+                v4(Ipv4Addr::UNSPECIFIED, 4100),
+                v6(Ipv6Addr::UNSPECIFIED, 4100)
+            ])
+        );
+        let loopback = BindPlan::new(BindScope::Loopback, None, never_asked);
+        assert_eq!(loopback.addrs(), Some(vec![v4(Ipv4Addr::LOCALHOST, 0)]));
+        let fixed = BindPlan::new(BindScope::Loopback, Some(4100), never_asked);
+        assert_eq!(fixed.addrs(), Some(vec![v4(Ipv4Addr::LOCALHOST, 4100)]));
+        for plan in [iroh, both, loopback, fixed] {
+            assert_eq!(plan.notice(), None, "{plan:?}");
+        }
+    }
+
+    #[test]
+    fn a_bind_port_on_a_kernel_with_no_ipv6_binds_ipv4_alone_and_says_so() {
+        let plan = BindPlan::new(BindScope::AllInterfaces, Some(4100), || false);
+        let v4 = SocketAddr::from((Ipv4Addr::UNSPECIFIED, 4100));
+        assert_eq!(plan, BindPlan::Ipv4Only(v4));
+        assert_eq!(plan.addrs(), Some(vec![v4]));
+        assert_eq!(
+            plan.notice().as_deref(),
+            Some("no IPv6 on this host: UDP port 4100 is bound for IPv4 only")
+        );
+    }
+
+    #[test]
+    fn only_address_family_not_supported_means_the_kernel_has_no_ipv6() {
+        use std::io::Error;
+        let unsupported = Error::from_raw_os_error(EAFNOSUPPORT);
+        // The constant is this target's own "address family not supported".
+        assert!(
+            unsupported
+                .to_string()
+                .starts_with("Address family not supported"),
+            "{unsupported}"
+        );
+        assert!(!ipv6_supported(Err(unsupported)));
+        assert!(ipv6_supported(Ok(())));
+        // Real failures of other kinds keep IPv6 in the plan, for the real
+        // bind to report: a port in use, an address the host does not have,
+        // and the two permission errors (EPERM 1, EACCES 13 on both targets).
+        let held = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let in_use = UdpSocket::bind(held.local_addr().unwrap()).unwrap_err();
+        let not_here = UdpSocket::bind((Ipv4Addr::new(192, 0, 2, 1), 0)).unwrap_err();
+        for other in [
+            in_use,
+            not_here,
+            Error::from_raw_os_error(1),
+            Error::from_raw_os_error(13),
+        ] {
+            assert!(other.raw_os_error().is_some(), "{other}");
+            assert!(ipv6_supported(Err(other)));
+        }
     }
 
     #[test]

@@ -250,7 +250,18 @@ impl Helper {
         relays: &[serde_json::Value],
         listen: bool,
     ) -> (EndpointId, SocketAddr) {
-        self.send(&self.start_op_for(relays, listen)).await;
+        self.start_with_op(&self.start_op_for(relays, listen), listen)
+            .await
+    }
+
+    /// Send `start_op`, and read `ready` and the bound-sockets log as
+    /// [`Self::start_on`] does.
+    pub async fn start_with_op(
+        &mut self,
+        start_op: &serde_json::Value,
+        listen: bool,
+    ) -> (EndpointId, SocketAddr) {
+        self.send(start_op).await;
         let Event::Ready { endpoint_id } = self.next_event().await else {
             panic!("start is answered with ready");
         };
@@ -398,6 +409,14 @@ pub async fn dial(
 /// the endpoint resolves no name and reaches nothing through it.
 pub fn dead_relay() -> serde_json::Value {
     json!({ "url": "https://127.0.0.1:1/", "quic_port": 1 })
+}
+
+/// A loopback UDP port nothing holds: bind one, learn it, close it.
+pub fn unused_udp_port() -> u16 {
+    std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+        .and_then(|socket| socket.local_addr())
+        .expect("a loopback UDP port")
+        .port()
 }
 
 /// The contract's `dial`.

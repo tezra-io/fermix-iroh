@@ -9,11 +9,13 @@ each accepted stream to one connection on a Unix socket the daemon listens on.
 It also lets the daemon reach another Fermix engine the same way: on the
 daemon's `dial` it dials that engine's endpoint, opens one stream and copies it
 to a Unix socket the daemon names for the dial. Started without a key and a
-bridge socket, the endpoint only dials, with a key held in memory.
+bridge socket, the endpoint only dials, with a key held in memory. Started with
+a `bind_port`, it binds that UDP port, so a server stays at the address its
+peers recorded across restarts.
 
 | | |
 |---|---|
-| Wire | NDJSON on stdio, `protocol_version` 3 |
+| Wire | NDJSON on stdio, `protocol_version` 4 |
 | iroh | `=1.3.0`, the `Minimal` preset, the daemon's relays only, no address lookup |
 | Application protocol | `fermix/mobile/1`, a phone; anything else is refused in the TLS handshake |
 | Bridge | one Unix-socket connection per stream: a 37-byte `FXB1` preamble, then the stream's bytes, unparsed |
@@ -31,12 +33,12 @@ bridge socket, the endpoint only dials, with a key held in memory.
 - **Not a parser.** It never reads the bytes it copies; they are the daemon's
   length-prefixed Noise frames, bounded by the daemon.
 - **Not a network client of anyone but the daemon's relays and peers.** It
-  binds UDP sockets for QUIC, asks the local router for a port mapping, probes
-  only the relays the daemon names, dials only the peers the daemon names
-  (through the relays and addresses the `dial` names), and resolves relay
-  names through the system's configured nameservers only. It opens no
-  listener, publishes nothing to an address lookup service, never uses n0's
-  relays, and ignores proxy variables.
+  binds UDP sockets for QUIC (on `start`'s `bind_port` when it names one),
+  asks the local router for a port mapping, probes only the relays the daemon
+  names, dials only the peers the daemon names (through the relays and
+  addresses the `dial` names), and resolves relay names through the system's
+  configured nameservers only. It opens no listener, publishes nothing to an
+  address lookup service, never uses n0's relays, and ignores proxy variables.
 - **Not a writer of anything.** It reads one file, the key, and writes none.
 
 ## The protocol is not ours
@@ -81,13 +83,13 @@ stop before the endpoint binds.
 
 | Suite | What it pins |
 |---|---|
-| unit tests (`src/`) | validation ranges (`start`'s key and socket together or not at all, every `dial` field), key file checks, framing, text sanitizing, the connection bound |
+| unit tests (`src/`) | validation ranges (`start`'s key and socket together or not at all, its `bind_port`, every `dial` field), the addresses a `bind_port` binds (IPv4 alone only on a kernel with no IPv6), key file checks, framing, text sanitizing, the connection bound |
 | `tests/fixtures.rs` | the vendored contract, byte for byte |
 | `tests/framing_props.rs` | property tests: arbitrary bytes never panic the reader or the decoder, no line exceeds 64 KiB, an over-long line is refused |
 | `tests/process.rs` | the binary over real pipes: `hello` first, exit codes, every failure before bind, a `dial` before `ready` |
 | `tests/relay_tls.rs` | the production relay verifier refuses a chain through a compromised eMudhra intermediate |
-| `tests/session.rs` | end to end over a local relay: preamble, copying both ways, every *Ending* rule, renewal on a second stream, stream credit, ALPN and busy refusals, a full helper making room for a new connection, unreachable bridge, `set_relays`, `close` (the daemon's last bytes first, later streams reset, that peer only, a lost connection still noticed, a peer that gives its stream no credit still closed), a stream given no credit reset 5 s after the daemon closes it, `closed`, shutdown within 5 s, end of stdin |
-| `tests/dial.rs` | dials between local helpers: through the local relay, and directly at a UDP address with no relay serving (`dialed` with its path, no preamble, copying both ways, either side ending first, `dial_closed`); a helper that only dials refusing every connection; `dial_failed` `refused`, `bridge_unreachable` (and the id free again at once), `timeout` (a stream that never opens, a peer nobody answers for), `unreachable` (a dial iroh cannot start), `busy` past 8 dials; a `dial_id` in flight is a bad request; shutdown ends dials in flight without an event |
+| `tests/session.rs` | end to end over a local relay: a `bind_port` another socket holds (`bind_failed` naming the port, no other port bound), preamble, copying both ways, every *Ending* rule, renewal on a second stream, stream credit, ALPN and busy refusals, a full helper making room for a new connection, unreachable bridge, `set_relays`, `close` (the daemon's last bytes first, later streams reset, that peer only, a lost connection still noticed, a peer that gives its stream no credit still closed), a stream given no credit reset 5 s after the daemon closes it, `closed`, shutdown within 5 s, end of stdin |
+| `tests/dial.rs` | dials between local helpers: through the local relay, and directly at a UDP address with no relay serving (`dialed` with its path, no preamble, copying both ways, either side ending first, `dial_closed`), that address the port the listener's `start` named; a dial that opens on the relay and moves to a direct path (`dial_path`, then `dial_closed`, and no `path` or `closed`); a helper that only dials refusing every connection; `dial_failed` `refused`, `bridge_unreachable` (and the id free again at once), `timeout` (a stream that never opens, a peer nobody answers for), `unreachable` (a dial iroh cannot start), `busy` past 8 dials; a `dial_id` in flight is a bad request; shutdown ends dials in flight without an event |
 
 ### The engine's end-to-end test
 
@@ -255,9 +257,9 @@ src/
 
 One code path per behaviour: there is no runtime switch, no environment
 override and no degraded mode. The test suite differs from the binary only in
-the `Network` it passes (trust the test relay's certificate, bind loopback, no
-port mapping), and the one constructor that trusts any certificate exists only
-in test builds.
+the `Network` it passes (trust the test relay's certificate, bind 127.0.0.1
+alone, a `bind_port` included, no port mapping), and the one constructor that
+trusts any certificate exists only in test builds.
 
 ## License
 

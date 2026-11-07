@@ -205,7 +205,7 @@ fn set_relays_before_start_is_a_bad_request() {
 fn a_start_outside_the_contract_is_a_bad_request() {
     let dir = tempfile::tempdir().unwrap();
     let key = key_file(dir.path(), 32, 0o600);
-    let mutations: [fn(&mut serde_json::Value); 8] = [
+    let mutations: [fn(&mut serde_json::Value); 12] = [
         |op| op["alpn"] = json!("fermix/mobile/2"),
         |op| op["secret_key_path"] = json!("relative/iroh_key"),
         |op| op["relays"] = json!([]),
@@ -216,6 +216,11 @@ fn a_start_outside_the_contract_is_a_bad_request() {
         |op| drop(op.as_object_mut().unwrap().remove("bridge_socket")),
         |op| drop(op.as_object_mut().unwrap().remove("secret_key_path")),
         |op| op["secret_key_path"] = json!(null),
+        // A bind port is 1 to 65,535, and absent, never null.
+        |op| op["bind_port"] = json!(0),
+        |op| op["bind_port"] = json!(65_536),
+        |op| op["bind_port"] = json!("4100"),
+        |op| op["bind_port"] = json!(null),
     ];
     for mutate in mutations {
         let mut op = start_op(&key, dir.path());

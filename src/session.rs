@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use crate::dial::Dialer;
-use crate::endpoint::{self, AcceptEnd, Acceptor, Network, RelayTable};
+use crate::endpoint::{self, AcceptEnd, Acceptor, BindPlan, Network, RelayTable};
 use crate::key;
 use crate::ndjson::{EventSink, EventWriter, LineError, LineReader};
 use crate::protocol::{
@@ -167,6 +167,7 @@ impl Session {
                 alpn,
                 relays,
                 limits,
+                bind_port,
             } => {
                 let cfg = StartConfig::validate(
                     secret_key_path.as_deref(),
@@ -174,6 +175,7 @@ impl Session {
                     &alpn,
                     &relays,
                     &limits,
+                    bind_port,
                 );
                 match cfg {
                     Ok(cfg) => self.start(cfg).await,
@@ -197,7 +199,11 @@ impl Session {
             Ok(key) => key,
             Err(e) => return Some(self.fail(e.code(), &e.to_string()).await),
         };
-        let bound = tokio::time::timeout(BIND_DEADLINE, endpoint::bind(key, &cfg, &self.net)).await;
+        // The kernel is asked about IPv6 only for a `bind_port` on every
+        // interface.
+        let plan = BindPlan::new(self.net.scope, cfg.bind_port, endpoint::kernel_has_ipv6);
+        let binding = endpoint::bind(key, &cfg, &self.net, &plan);
+        let bound = tokio::time::timeout(BIND_DEADLINE, binding).await;
         let endpoint = match bound {
             Ok(Ok(endpoint)) => endpoint,
             Ok(Err(e)) => return Some(self.fail(ErrorCode::BindFailed, &e).await),
@@ -212,6 +218,9 @@ impl Session {
             })
             .await;
         self.sink.emit(bound_sockets_log(&endpoint)).await;
+        if let Some(notice) = plan.notice() {
+            self.sink.emit(Event::log(LogLevel::Info, &notice)).await;
+        }
         self.running = Some(self.launch(endpoint, &cfg));
         None
     }

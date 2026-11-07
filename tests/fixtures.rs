@@ -25,6 +25,7 @@ const EVENT_FIXTURES: &[&str] = &[
     "log.json",
     "error.json",
     "dialed.json",
+    "dial_path.json",
     "dial_failed.json",
     "dial_closed.json",
 ];
@@ -32,6 +33,7 @@ const EVENT_FIXTURES: &[&str] = &[
 const OP_FIXTURES: &[&str] = &[
     "start.json",
     "start_dial_only.json",
+    "start_bind_port.json",
     "set_relays.json",
     "close.json",
     "dial.json",
@@ -101,6 +103,7 @@ fn validated_start(name: &str) -> fermix_iroh::protocol::StartConfig {
         alpn,
         relays,
         limits,
+        bind_port,
     } = decode_op(&line).unwrap()
     else {
         panic!("{name} is not a start");
@@ -111,6 +114,7 @@ fn validated_start(name: &str) -> fermix_iroh::protocol::StartConfig {
         &alpn,
         &relays,
         &limits,
+        bind_port,
     )
     .unwrap_or_else(|e| panic!("the contract's own {name} is invalid: {e}"))
 }
@@ -121,10 +125,16 @@ fn the_start_fixtures_validate() {
     assert_eq!(cfg.kind, KIND_PHONE);
     assert_eq!(cfg.relays.len(), 2);
     assert!(cfg.listen.is_some());
+    assert_eq!(cfg.bind_port, None);
     let dial_only = validated_start("start_dial_only.json");
     assert_eq!(dial_only.listen, None);
     assert_eq!(dial_only.relays, cfg.relays);
     assert_eq!(dial_only.limits, cfg.limits);
+    let fixed = validated_start("start_bind_port.json");
+    assert_eq!(fixed.bind_port, Some(4100));
+    assert_eq!(fixed.listen, cfg.listen);
+    assert_eq!(fixed.relays, cfg.relays);
+    assert_eq!(fixed.limits, cfg.limits);
 }
 
 fn validated_dial(name: &str) -> DialConfig {

@@ -4,6 +4,7 @@
 
 mod support;
 
+use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
 use fermix_iroh::bridge::ACK_DEADLINE;
@@ -13,7 +14,7 @@ use iroh::endpoint::{Connection, ConnectionError, ReadError, ReadToEndError, Var
 use iroh::{Endpoint, SecretKey};
 use serde_json::json;
 use support::{
-    ALPN, Helper, TestRelay, accept_bridge, bounded, dial, expected_preamble, phone,
+    ALPN, Helper, TestRelay, accept_bridge, bounded, dead_relay, dial, expected_preamble, phone,
     phone_giving_no_credit, within,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -49,6 +50,30 @@ async fn start_answers_ready_with_the_keys_endpoint_id_then_logs_and_reports_the
         helper.wait_relay_connected(&relay).await;
         helper.close_stdin();
         assert_eq!(helper.exit().await.0, Exit::Shutdown);
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bind_port_another_socket_holds_is_bind_failed_naming_the_port() {
+    bounded(async {
+        // The test holds the port until the helper has failed.
+        let held = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = held.local_addr().unwrap().port();
+        let mut helper = Helper::spawn().await;
+        let mut op = helper.start_op_for(&[dead_relay()], true);
+        op["bind_port"] = json!(port);
+        helper.send(&op).await;
+
+        // No `ready` on another port first: the bind fails, and says where.
+        let event = helper.next_event().await;
+        assert!(
+            matches!(&event, Event::Error { code: ErrorCode::BindFailed, message }
+                if message.starts_with(&format!("UDP port {port} ")) && message.contains("in use")),
+            "{event:?}"
+        );
+        assert_eq!(helper.exit().await.0, Exit::Fatal);
+        drop(held);
     })
     .await;
 }
