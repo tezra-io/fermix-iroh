@@ -148,12 +148,12 @@ jobs:
       matrix:
         include:
           - target: aarch64-apple-darwin
-            runner: macos-14
+            runner: macos-15
             asset: macos-aarch64
           # Cross-compiled on the arm64 runner: GitHub's Intel macOS runners
           # are being retired, and the helper needs no Intel host to build.
           - target: x86_64-apple-darwin
-            runner: macos-14
+            runner: macos-15
             asset: macos-x86_64
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm
